@@ -397,17 +397,82 @@ pub fn get_topic_size(&self, topic: &str) -> u64
   Total bytes used by the topic (0 if topic doesn't exist)
 </ResponseField>
 
-## Backend Control
+## Helper Functions
+
+### topic_entry_count()
+
+Returns the entry count for a specific topic.
+
+```rust
+pub fn topic_entry_count(wal: &Walrus, topic: &str) -> u64
+```
+
+<ParamField path="wal" type="&Walrus" required>
+  Reference to a Walrus instance
+</ParamField>
+
+<ParamField path="topic" type="&str" required>
+  The topic name
+</ParamField>
+
+<ResponseField name="return" type="u64">
+  Number of entries written to the topic
+</ResponseField>
+
+**Example:**
+
+```rust
+use walrus_rust::{Walrus, topic_entry_count};
+
+let wal = Walrus::new()?;
+wal.append_for_topic("events", b"data")?;
+
+let count = topic_entry_count(&wal, "events");
+println!("Entry count: {}", count);
+```
+
+### topic_entry_counts()
+
+Returns entry counts for all topics.
+
+```rust
+pub fn topic_entry_counts(wal: &Walrus) -> HashMap<String, u64>
+```
+
+<ParamField path="wal" type="&Walrus" required>
+  Reference to a Walrus instance
+</ParamField>
+
+<ResponseField name="return" type="HashMap<String, u64>">
+  Map of topic names to their entry counts
+</ResponseField>
+
+**Example:**
+
+```rust
+use walrus_rust::{Walrus, topic_entry_counts};
+
+let wal = Walrus::new()?;
+let counts = topic_entry_counts(&wal);
+for (topic, count) in counts {
+    println!("{}: {} entries", topic, count);
+}
+```
+
+## Module Functions
+
+These functions control global backend behavior and must be called before creating any Walrus instances.
 
 ### enable_fd_backend()
 
-Enables the FD (file descriptor) backend with pread/pwrite.
+Enables the FD (file descriptor) backend with pread/pwrite (default).
 
 ```rust
-pub fn enable_fd_backend()
-```
+use walrus_rust::enable_fd_backend;
 
-**Note:** Must be called before creating any Walrus instances.
+enable_fd_backend();
+let wal = Walrus::new()?;
+```
 
 **Features:**
 - Uses io_uring on Linux for batch operations
@@ -418,10 +483,11 @@ pub fn enable_fd_backend()
 Disables the FD backend and uses memory-mapped files instead.
 
 ```rust
-pub fn disable_fd_backend()
-```
+use walrus_rust::disable_fd_backend;
 
-**Note:** Must be called before creating any Walrus instances.
+disable_fd_backend();
+let wal = Walrus::new()?;
+```
 
 **Features:**
 - Uses memory-mapped files
@@ -433,4 +499,3 @@ pub fn disable_fd_backend()
 - [Entry (WalEntry)](/api/wal-entry) - Structure returned by read operations
 - [ReadConsistency](/api/read-consistency) - Consistency model configuration
 - [FsyncSchedule](/api/fsync-schedule) - Fsync timing configuration
-- WalrusBuilder - Builder pattern for instance creation
