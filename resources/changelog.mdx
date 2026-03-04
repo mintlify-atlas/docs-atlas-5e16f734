@@ -1,0 +1,296 @@
+---
+title: Changelog
+description: Version history and release notes for the Walrus distributed log streaming engine
+---
+
+This page documents the evolution of Walrus from a single-node WAL library to a distributed message streaming platform.
+
+## Version 0.3.0
+
+<Tip>
+This is the current major release introducing the distributed streaming platform.
+</Tip>
+
+### Distributed Message Streaming Platform
+
+Walrus 0.3.0 represents a major architectural evolution, transforming the single-node WAL engine into a fault-tolerant distributed system.
+
+<CardGroup cols={2}>
+  <Card title="Raft Consensus" icon="users">
+    Integrated Raft consensus (Octopii) for metadata coordination across cluster nodes.
+  </Card>
+  
+  <Card title="Segment-Based Sharding" icon="layer-group">
+    Topics split into segments with automatic leadership rotation for load balancing.
+  </Card>
+  
+  <Card title="Lease-Based Write Fencing" icon="lock">
+    Only designated leaders can write to segments, preventing split-brain scenarios.
+  </Card>
+  
+  <Card title="Automatic Rollover" icon="rotate">
+    Monitor loop triggers segment rollover when threshold exceeded (~1M entries).
+  </Card>
+</CardGroup>
+
+### New Features
+
+#### TCP Client Protocol
+
+Simple length-prefixed text protocol for producers and consumers:
+
+```
+Commands:
+  REGISTER <topic>       → Create topic if missing
+  PUT <topic> <payload>  → Append to topic
+  GET <topic>            → Read next entry
+  STATE <topic>          → Get topic metadata
+  METRICS                → Get Raft metrics
+```
+
+#### Interactive CLI
+
+New `walrus-cli` binary for cluster interaction:
+
+```bash
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091
+```
+
+#### Comprehensive Test Suite
+
+Integration tests for distributed scenarios:
+
+- `cluster-test-logs` - Basic smoke test
+- `cluster-test-rollover` - Segment rollover
+- `cluster-test-resilience` - Node failure recovery
+- `cluster-test-recovery` - Cluster restart persistence
+- `cluster-test-stress` - Concurrent writes
+- `cluster-test-multi-topic` - Multiple topics
+
+### Architecture Components
+
+<AccordionGroup>
+  <Accordion title="Node Controller">
+    Routes client requests to appropriate segment leaders, manages write leases synchronized every 100ms, tracks logical offsets for rollover detection.
+  </Accordion>
+  
+  <Accordion title="Raft Engine (Octopii)">
+    Maintains consensus for metadata changes only (not data path). Handles leader election and log replication across nodes.
+  </Accordion>
+  
+  <Accordion title="Cluster Metadata">
+    Raft state machine storing topic → segment → leader mappings, sealed segment counts, and node addresses.
+  </Accordion>
+  
+  <Accordion title="Storage Engine">
+    Wraps Walrus engine with lease-based write fencing. Only accepts writes if node holds lease for that segment.
+  </Accordion>
+</AccordionGroup>
+
+### Configuration
+
+New environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WALRUS_MAX_SEGMENT_ENTRIES` | `1000000` | Entries before rollover |
+| `WALRUS_MONITOR_CHECK_MS` | `10000` | Monitor loop interval |
+
+### Breaking Changes
+
+<Warning>
+Version 0.3.0 introduces a new distributed architecture. Applications using the standalone library (0.2.x) can continue using `walrus-rust` crate unchanged. Distributed features require migration to the new cluster architecture.
+</Warning>
+
+---
+
+## Version 0.2.0
+
+### Batch Operations and io_uring
+
+This release focused on performance improvements through batch operations and asynchronous I/O.
+
+### New Features
+
+#### Atomic Batch Writes
+
+```rust
+let entries = vec![
+    b"entry1".to_vec(),
+    b"entry2".to_vec(),
+    b"entry3".to_vec(),
+];
+wal.batch_append_for_topic("my-topic", &entries)?;
+```
+
+<Card title="Performance Benefit" icon="gauge-high">
+  Batch operations reduce syscall overhead and enable io_uring optimizations on Linux.
+</Card>
+
+#### Batch Read Operations
+
+```rust
+let entries = wal.batch_read_for_topic("my-topic", 10, true)?;
+for entry in entries {
+    println!("Read: {:?}", String::from_utf8_lossy(&entry.data));
+}
+```
+
+#### io_uring Support
+
+On Linux, Walrus can leverage io_uring for asynchronous batched I/O operations, significantly improving throughput.
+
+<Note>
+Disable io_uring with the `WALRUS_DISABLE_IO_URING` environment variable if compatibility issues arise.
+</Note>
+
+#### Dual Storage Backends
+
+Two backend implementations:
+
+<CardGroup cols={2}>
+  <Card title="FD Backend" icon="file">
+    Uses `pread`/`pwrite` syscalls for file operations. Compatible with all platforms.
+  </Card>
+  
+  <Card title="Mmap Backend" icon="map">
+    Memory-mapped I/O for improved read performance. Default on most platforms.
+  </Card>
+</CardGroup>
+
+#### Namespace Isolation
+
+New `_for_key` constructors for multi-tenancy:
+
+```rust
+let wal1 = Walrus::new_for_key("tenant1")?;
+let wal2 = Walrus::new_for_key("tenant2")?;
+```
+
+### Improvements
+
+<AccordionGroup>
+  <Accordion title="Fsync Modes">
+    Added `FsyncSchedule::SyncEach` for durability and `FsyncSchedule::NoFsync` for maximum throughput.
+    
+    ```rust
+    let config = WalConfig {
+        fsync_schedule: FsyncSchedule::SyncEach,
+        ..Default::default()
+    };
+    ```
+  </Accordion>
+  
+  <Accordion title="Enhanced Documentation">
+    Comprehensive architecture documentation, design docs, and API reference improvements.
+  </Accordion>
+  
+  <Accordion title="Expanded Benchmarks">
+    Added benchmarks for batch operations comparing Walrus against Kafka and RocksDB.
+  </Accordion>
+</AccordionGroup>
+
+### Bug Fixes
+
+- **Fixed**: Tail read offset tracking in concurrent scenarios where multiple readers access the same topic
+- **Fixed**: Edge case in cursor advancement when segment boundaries align with read batch sizes
+
+---
+
+## Version 0.1.0
+
+### Initial Release
+
+The first public release of Walrus as a standalone Write-Ahead Log library.
+
+### Core Features
+
+<CardGroup cols={2}>
+  <Card title="WAL Functionality" icon="database">
+    Append-only log storage with sequential write guarantees.
+  </Card>
+  
+  <Card title="Topic-Based Organization" icon="folder">
+    Logical separation of data streams into named topics.
+  </Card>
+  
+  <Card title="Consistency Modes" icon="shield-check">
+    Configurable fsync policies for durability vs. throughput tradeoffs.
+  </Card>
+  
+  <Card title="Persistent Cursors" icon="bookmark">
+    Read offset tracking survives process restarts.
+  </Card>
+</CardGroup>
+
+### API Example
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+// Create a new WAL instance
+let wal = Walrus::new()?;
+
+// Write data to a topic
+wal.append_for_topic("my-topic", b"Hello, Walrus!")?;
+
+// Read data from the topic
+if let Some(entry) = wal.read_next("my-topic", true)? {
+    println!("Read: {:?}", String::from_utf8_lossy(&entry.data));
+}
+```
+
+### Benchmarks
+
+Initial benchmark suite comparing Walrus against industry-standard systems:
+
+- RocksDB Write-Ahead Log
+- Apache Kafka (single broker)
+
+See [Performance Benchmarks](/resources/benchmarks) for detailed results.
+
+### Memory-Mapped I/O
+
+Implemented mmap-based backend for improved read performance on sequential workloads.
+
+---
+
+## Future Roadmap
+
+Planned features for upcoming releases:
+
+<CardGroup cols={2}>
+  <Card title="Multi-Segment Writes" icon="layer-plus">
+    Allow concurrent writes to multiple segments within a topic for higher aggregate throughput.
+  </Card>
+  
+  <Card title="Compression" icon="file-zipper">
+    Optional compression for sealed segments to reduce storage overhead.
+  </Card>
+  
+  <Card title="Read-Ahead Caching" icon="forward">
+    Predictive caching for sequential read workloads to improve latency.
+  </Card>
+  
+  <Card title="Replication" icon="copy">
+    Data-level replication across nodes for durability (currently metadata-only).
+  </Card>
+</CardGroup>
+
+<Note>
+Feature roadmap is subject to change based on community feedback and project priorities. See [Contributing](/resources/contributing) to help shape future development.
+</Note>
+
+---
+
+## Version Support
+
+| Version | Status | Support |
+|---------|--------|----------|
+| 0.3.x   | **Current** | Active development |
+| 0.2.x   | Maintenance | Security fixes only |
+| 0.1.x   | End of Life | No longer supported |
+
+<Warning>
+Users on versions 0.1.x should upgrade to 0.2.x or later for continued support.
+</Warning>

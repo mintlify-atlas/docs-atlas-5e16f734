@@ -1,0 +1,379 @@
+---
+title: Contributing Guide
+description: How to contribute to the Walrus project - code, documentation, bug reports, and feature requests
+---
+
+Thank you for your interest in contributing to Walrus! We welcome contributions from the community and appreciate your help in making this project better.
+
+## Getting Started
+
+Follow these steps to start contributing:
+
+<Steps>
+  <Step title="Fork the repository">
+    Create your own fork of the Walrus repository on GitHub.
+  </Step>
+  <Step title="Clone your fork locally">
+    ```bash
+    git clone https://github.com/YOUR_USERNAME/walrus.git
+    cd walrus
+    ```
+  </Step>
+  <Step title="Create a new branch">
+    ```bash
+    git checkout -b feature/your-feature-name
+    ```
+  </Step>
+  <Step title="Make your changes">
+    Implement your bug fix, feature, or documentation improvement.
+  </Step>
+  <Step title="Test thoroughly">
+    Ensure all existing tests pass and add new tests if needed.
+  </Step>
+  <Step title="Submit a pull request">
+    Push your branch and open a PR with a clear description of your changes.
+  </Step>
+</Steps>
+
+## Requirements
+
+### Testing
+
+<Warning>
+**All changes must pass the existing test suite.** This is a strict requirement for all pull requests.
+</Warning>
+
+Before submitting your pull request:
+
+1. **Run the full test suite**
+   ```bash
+   cd distributed-walrus
+   make test
+   ```
+
+2. **Ensure all tests pass** without any failures or warnings
+
+3. **Add tests for new functionality** if you're introducing new features
+
+4. **Run benchmarks for performance changes**
+   ```bash
+   cd walrus-rust
+   cargo bench
+   ```
+
+### Available Tests
+
+The distributed Walrus system includes comprehensive integration tests:
+
+<CodeGroup>
+```bash Basic Smoke Test
+make cluster-test-logs
+```
+
+```bash Segment Rollover
+make cluster-test-rollover
+```
+
+```bash Node Failure Recovery
+make cluster-test-resilience
+```
+
+```bash Cluster Restart Persistence
+make cluster-test-recovery
+```
+
+```bash Concurrent Writes Stress Test
+make cluster-test-stress
+```
+
+```bash Multiple Topics
+make cluster-test-multi-topic
+```
+</CodeGroup>
+
+### Code Quality
+
+<CardGroup cols={2}>
+  <Card title="Clear Code" icon="code">
+    Write self-documenting code with appropriate comments explaining complex logic.
+  </Card>
+  <Card title="Follow Conventions" icon="book">
+    Match existing code patterns and naming conventions in the project.
+  </Card>
+  <Card title="Rust Best Practices" icon="rust">
+    Use idiomatic Rust with proper error handling and ownership patterns.
+  </Card>
+  <Card title="Documentation" icon="file-lines">
+    Update relevant documentation when changing public APIs.
+  </Card>
+</CardGroup>
+
+## Types of Contributions
+
+We welcome various types of contributions:
+
+### Bug Fixes
+
+Help us identify and fix issues in the codebase:
+
+- Search existing issues first to avoid duplicates
+- Include reproduction steps in your PR description
+- Add regression tests when possible
+- Reference the issue number in your commit message
+
+### Feature Additions
+
+Propose and implement new functionality:
+
+- Open an issue to discuss the feature before implementing
+- Ensure the feature aligns with project goals
+- Include comprehensive tests for the new functionality
+- Update documentation and examples
+
+### Performance Improvements
+
+Optimize existing code:
+
+- Include benchmark results showing the improvement
+- Explain the optimization technique used
+- Ensure correctness is not compromised
+- Test under various workloads
+
+### Documentation
+
+Improve code comments, README, or other documentation:
+
+- Fix typos and clarify confusing explanations
+- Add examples for common use cases
+- Update outdated information
+- Improve API documentation
+
+### Tests
+
+Add test coverage for existing functionality:
+
+- Focus on edge cases and error conditions
+- Add integration tests for complex workflows
+- Improve test clarity and maintainability
+
+### Bug Reports
+
+Report issues you encounter:
+
+- Use a clear and descriptive title
+- Provide detailed steps to reproduce
+- Include system information (OS, Rust version, etc.)
+- Add relevant error messages or logs
+- Check if the issue already exists
+
+### Feature Requests
+
+Suggest new features or improvements:
+
+- Clearly describe the proposed feature
+- Explain the use case and benefits
+- Discuss potential implementation approaches
+- Be open to feedback and alternative solutions
+
+## Submitting Issues
+
+When creating a new issue, please include:
+
+<AccordionGroup>
+  <Accordion title="Clear and Descriptive Title">
+    Use a concise title that summarizes the issue or feature request.
+    
+    **Good**: "Segment rollover fails when Raft leader changes during operation"
+    
+    **Bad**: "Bug in rollover"
+  </Accordion>
+  
+  <Accordion title="Detailed Steps to Reproduce">
+    For bug reports, provide exact steps to reproduce the issue:
+    
+    1. Start a 3-node cluster with `make cluster-bootstrap`
+    2. Create topic "test" with `REGISTER test`
+    3. Write 1M entries to trigger rollover
+    4. Observe error in node logs
+  </Accordion>
+  
+  <Accordion title="System Information">
+    Include relevant environment details:
+    
+    - Operating System: Ubuntu 22.04 LTS
+    - Rust Version: 1.75.0
+    - Walrus Version: 0.3.0
+    - Hardware: 4 CPU cores, 8GB RAM
+  </Accordion>
+  
+  <Accordion title="Error Messages and Logs">
+    Copy complete error messages and relevant log excerpts:
+    
+    ```
+    [ERROR] Failed to seal segment: lease expired
+    [DEBUG] Current lease holder: node-2, attempted writer: node-1
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Pull Request Process
+
+Follow these guidelines when submitting a pull request:
+
+<Steps>
+  <Step title="Ensure Requirements">
+    Verify your code follows all requirements above (tests pass, code quality maintained).
+  </Step>
+  
+  <Step title="Update Documentation">
+    If your changes affect the public API or user-facing behavior, update relevant documentation.
+  </Step>
+  
+  <Step title="Add or Update Tests">
+    Include appropriate tests for your changes. All new functionality must have test coverage.
+  </Step>
+  
+  <Step title="Write Clear PR Description">
+    Describe the problem your PR solves and your solution approach:
+    
+    ```markdown
+    ## Problem
+    Segment rollover occasionally fails when Raft leader changes during the operation.
+    
+    ## Solution
+    Added retry logic with exponential backoff when rollover proposals fail due to leadership changes.
+    
+    ## Testing
+    - Added integration test `cluster-test-rollover-with-leadership-change`
+    - Verified existing tests still pass
+    - Tested under stress with `make cluster-test-stress`
+    ```
+  </Step>
+  
+  <Step title="Link Related Issues">
+    Reference any related issues in your PR description:
+    
+    ```markdown
+    Fixes #123
+    Related to #456
+    ```
+  </Step>
+</Steps>
+
+## Development Environment
+
+### Prerequisites
+
+<Tabs>
+  <Tab title="Rust">
+    Install Rust 1.70 or later:
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
+  </Tab>
+  
+  <Tab title="Linux (Optional)">
+    For io_uring support on Linux:
+    ```bash
+    sudo apt-get install liburing-dev
+    ```
+  </Tab>
+  
+  <Tab title="TLA+ (Optional)">
+    For formal verification work:
+    ```bash
+    # Download TLA+ Toolbox from
+    # https://github.com/tlaplus/tlaplus/releases
+    ```
+  </Tab>
+</Tabs>
+
+### Building the Project
+
+```bash
+# Build the core library
+cd walrus-rust
+cargo build --release
+
+# Build the distributed system
+cd distributed-walrus
+cargo build --release
+
+# Run local development cluster
+make cluster-bootstrap
+```
+
+### Code Structure
+
+<CodeGroup>
+```plaintext Core Library
+walrus-rust/
+├── src/
+│   ├── lib.rs              # Public API
+│   ├── engine.rs           # WAL engine implementation
+│   ├── storage/            # Storage backends (mmap, fd)
+│   └── batch.rs            # Batch operations
+├── benches/                # Benchmark suite
+└── tests/                  # Integration tests
+```
+
+```plaintext Distributed System
+distributed-walrus/
+├── src/
+│   ├── node/               # Node controller
+│   ├── raft/               # Raft consensus (Octopii)
+│   ├── metadata/           # Cluster metadata
+│   ├── storage/            # Walrus storage wrapper
+│   └── client/             # Client protocol
+├── spec/                   # TLA+ specification
+└── tests/                  # Integration tests
+```
+</CodeGroup>
+
+## Questions and Support
+
+If you have questions about contributing or need help getting started:
+
+<CardGroup cols={2}>
+  <Card title="Open an Issue" icon="github">
+    Create an issue with the "question" label for general questions.
+  </Card>
+  
+  <Card title="Check Existing Issues" icon="magnifying-glass">
+    Search existing issues and discussions for similar questions.
+  </Card>
+  
+  <Card title="Review Documentation" icon="book">
+    Check the [Architecture Guide](/concepts/architecture) and [README](https://github.com/nubskr/walrus) for context.
+  </Card>
+  
+  <Card title="Review Examples" icon="code">
+    Look at existing tests and examples in the codebase.
+  </Card>
+</CardGroup>
+
+## Code of Conduct
+
+Please be respectful and constructive in all interactions. We're here to build something great together!
+
+<Note>
+All contributors are expected to:
+- Be welcoming to newcomers
+- Provide constructive feedback
+- Accept criticism gracefully
+- Focus on what is best for the community
+- Show empathy towards other community members
+</Note>
+
+## Recognition
+
+Contributors are recognized in:
+
+- Git commit history
+- Pull request acknowledgments
+- Project documentation
+- Release notes for significant contributions
+
+---
+
+Thank you for contributing to Walrus! Your efforts help make this project better for everyone.

@@ -1,0 +1,492 @@
+---
+title: "Bucket Storage"
+description: "Lease-based write fencing and storage operations over Walrus"
+---
+
+## Overview
+
+The `Storage` component provides a thin, thread-safe wrapper around the Walrus storage engine. Its primary responsibility is enforcing write fencing through lease management—ensuring that only the designated leader for a segment can write to it. This prevents split-brain scenarios and maintains consistency across leadership changes.
+
+**Location:** `distributed-walrus/src/bucket.rs`
+
+## Architecture
+
+```
+┌─────────────────────────────────────────┐
+│         Storage (Bucket)                │
+│  ┌────────────────────────────────────┐ │
+│  │  Lease-based Write Fencing         │ │
+│  └────────────────────────────────────┘ │
+│  ┌────────────────────────────────────┐ │
+│  │  Per-key Write Mutexes             │ │
+│  └────────────────────────────────────┘ │
+│  ┌────────────────────────────────────┐ │
+│  │  Walrus Engine (IO Layer)          │ │
+│  └────────────────────────────────────┘ │
+└─────────────────────────────────────────┘
+```
+
+## Structure
+
+**Location:** `bucket.rs:15`
+
+```rust
+pub struct Storage {
+    engine: Arc<Walrus>,
+    active_leases: RwLock<HashSet<String>>,
+    write_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+}
+```
+
+### Fields
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `engine` | `Arc<Walrus>` | Underlying Walrus storage engine for durable I/O |
+| `active_leases` | `RwLock<HashSet<String>>` | Set of WAL keys this node currently has permission to write |
+| `write_locks` | `RwLock<HashMap<String, Arc<Mutex<()>>>>` | Per-key mutexes to serialize concurrent writers |
+
+### Constants
+
+```rust
+pub const DATA_NAMESPACE: &str = "data_plane";
+```
+
+The namespace used for all data plane storage operations in Walrus.
+
+## Initialization
+
+### `new`
+
+Creates a new storage instance rooted at the specified directory.
+
+**Location:** `bucket.rs:23`
+
+```rust
+pub async fn new(storage_path: PathBuf) -> Result<Self>
+```
+
+**Process:**
+1. Creates parent directories if needed
+2. Creates storage directory
+3. Optionally disables io_uring if `WALRUS_DISABLE_IO_URING` env var is set
+4. Sets `WALRUS_DATA_DIR` environment variable
+5. Initializes Walrus engine with `DATA_NAMESPACE`
+6. Returns new `Storage` instance with empty leases and locks
+
+**Environment Variables:**
+- `WALRUS_DISABLE_IO_URING` - Set to use mmap backend instead of io_uring (useful in containers)
+- `WALRUS_DATA_DIR` - Automatically set to storage_path for Walrus engine
+
+<Note>
+io_uring support may be unavailable in containerized environments. Set `WALRUS_DISABLE_IO_URING=1` to fall back to mmap-based I/O.
+</Note>
+
+## Write Operations
+
+### `append_by_key`
+
+Appends data to a specific WAL key with lease verification and write locking.
+
+**Location:** `bucket.rs:44`
+
+```rust
+pub async fn append_by_key(&self, wal_key: &str, data: Vec<u8>) -> Result<()>
+```
+
+**Process:**
+1. Acquires `BucketGuard` which:
+   - Verifies this node holds a lease for the WAL key via `ensure_lease`
+   - Acquires per-key write mutex to serialize concurrent appends
+2. Spawns blocking task to perform `engine.batch_append_for_topic`
+3. Returns success or error
+
+**Guarantees:**
+- **Lease Fencing**: Only succeeds if node holds active lease
+- **Serialization**: Multiple concurrent appends to same key are ordered
+- **Durability**: Walrus engine handles fsync and crash consistency
+
+**Error Cases:**
+- Returns `NotLeaderForPartition` if lease check fails
+- Returns Walrus error if underlying append fails
+
+<Warning>
+Attempting to write without a lease will fail with `NotLeaderForPartition`. The controller must call `update_leases()` before writing to new keys.
+</Warning>
+
+### Write Fencing with BucketGuard
+
+The `BucketGuard` RAII type enforces the write fencing protocol.
+
+**Location:** `bucket.rs:93`
+
+```rust
+struct BucketGuard<'a> {
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+    _storage: &'a Storage,
+}
+```
+
+#### `BucketGuard::lock`
+
+**Location:** `bucket.rs:99`
+
+```rust
+async fn lock(storage: &'a Storage, wal_key: &str) -> Result<Self>
+```
+
+**Atomically performs:**
+1. **Lease Check**: Calls `ensure_lease()` to verify write permission
+2. **Lock Acquisition**: Gets per-key mutex via `lock_for_key()`
+3. **Returns**: Guard that holds both lease verification and write lock
+
+The guard is automatically dropped when the append completes, releasing the write lock.
+
+### `ensure_lease` (Internal)
+
+Verifies that the current node holds a lease for a WAL key.
+
+**Location:** `bucket.rs:111`
+
+```rust
+async fn ensure_lease(&self, wal_key: &str) -> Result<()>
+```
+
+**Process:**
+1. Acquires read lock on `active_leases`
+2. Checks if `wal_key` is in the set
+3. Returns `Ok(())` if present
+4. Returns error with current lease set logged if absent
+
+**Performance:** O(1) hash set lookup with read lock (no contention on reads)
+
+## Read Operations
+
+### `read_one`
+
+Reads the next available entry from a WAL key.
+
+**Location:** `bucket.rs:53`
+
+```rust
+pub async fn read_one(&self, wal_key: &str) -> Result<Option<Vec<u8>>>
+```
+
+**Process:**
+1. Spawns blocking task to call `engine.read_next()`
+2. Returns `Some(data)` if entry available
+3. Returns `None` if no entry available
+4. Returns error on I/O failure
+
+**Characteristics:**
+- **No Lease Check**: Reads can be served by any node (useful for historical segments)
+- **Non-blocking**: Uses async task spawning to avoid blocking executor
+- **Cursor Management**: Walrus maintains internal read cursors per topic
+
+**Use Cases:**
+- Reading from current segment (leader serves)
+- Reading from sealed segments (any node can serve)
+- Consumer group implementations
+
+## Lease Management
+
+### `update_leases`
+
+Updates the set of active leases, adding new ones and removing stale ones.
+
+**Location:** `bucket.rs:60`
+
+```rust
+pub async fn update_leases(&self, expected: &HashSet<String>)
+```
+
+**Process:**
+1. **Fast Path**: Read lock check if leases already match (common case)
+2. **Slow Path**: If mismatch detected:
+   - Acquires write lock on `active_leases`
+   - Removes keys not in `expected` set
+   - Adds keys from `expected` set
+   - Releases write lock
+
+**Optimization:** Fast path avoids write lock contention when leases haven't changed.
+
+**Called By:**
+- `NodeController::update_leases()` every 100ms
+- After metadata changes
+- During retry operations
+
+**Example Flow:**
+
+```
+Current leases: {t_events_s_1, t_logs_s_2}
+Expected leases: {t_events_s_1, t_metrics_s_1}
+
+Result:
+  - Retain: t_events_s_1 (in both)
+  - Remove: t_logs_s_2 (not in expected)
+  - Add: t_metrics_s_1 (new in expected)
+
+Final leases: {t_events_s_1, t_metrics_s_1}
+```
+
+### `lock_for_key` (Internal)
+
+Retrieves or creates a per-key write mutex.
+
+**Location:** `bucket.rs:76`
+
+```rust
+async fn lock_for_key(&self, key: &str) -> Arc<Mutex<()>>
+```
+
+**Process:**
+1. **Fast Path**: Read lock check for existing mutex
+2. **Slow Path**: If not found:
+   - Acquires write lock on `write_locks`
+   - Creates new mutex if still absent (double-check pattern)
+   - Returns cloned Arc to mutex
+
+**Design:** Lazy mutex creation avoids allocating locks for keys that are never written.
+
+## Additional Operations
+
+### `get_topic_size_blocking`
+
+Returns the size in bytes of a specific WAL key's data.
+
+**Location:** `bucket.rs:88`
+
+```rust
+#[allow(dead_code)]
+pub fn get_topic_size_blocking(&self, wal_key: &str) -> u64
+```
+
+**Characteristics:**
+- **Blocking**: Runs synchronously (use from blocking context)
+- **No I/O**: Fast metadata-only operation
+- **Use Cases**: Monitoring, debugging, capacity planning
+
+<Note>
+This method is currently unused but available for future monitoring implementations.
+</Note>
+
+## Write Fencing Guarantees
+
+The lease-based fencing protocol prevents data corruption during leadership changes:
+
+### Scenario: Leadership Transfer
+
+```
+1. Node 1 is leader for t_events_s_1
+   - Holds lease for t_events_s_1
+   - Can write successfully
+
+2. Metadata changes: Node 2 becomes leader
+   - Raft log entry committed
+   - Node 2 updates leases: adds t_events_s_1
+   - Node 1 updates leases: removes t_events_s_1
+
+3. Node 1 attempts write after lease loss
+   - ensure_lease() fails
+   - Returns NotLeaderForPartition
+   - Write is rejected
+
+4. Node 2 writes proceed normally
+   - ensure_lease() succeeds
+   - Write committed to Walrus
+```
+
+### Key Properties
+
+<CardGroup cols={2}>
+  <Card title="Mutual Exclusion" icon="lock">
+    Only one node can hold a lease for a key at a time (enforced by metadata)
+  </Card>
+  <Card title="Fail-Fast" icon="bolt">
+    Writes fail immediately if lease is not held, preventing corruption
+  </Card>
+  <Card title="Lease Revocation" icon="ban">
+    Stale leaders lose write permission within one lease update cycle (100ms)
+  </Card>
+  <Card title="No Split-Brain" icon="shield">
+    Even with network partitions, only metadata-acknowledged leader can write
+  </Card>
+</CardGroup>
+
+## Concurrency Control
+
+### Per-Key Mutexes
+
+The `write_locks` map provides fine-grained concurrency:
+
+**Benefits:**
+- **Parallelism**: Writes to different keys don't block each other
+- **Ordering**: Writes to same key are serialized in arrival order
+- **No Deadlocks**: Single mutex per operation (no lock ordering issues)
+
+**Example:**
+
+```
+Thread 1: append t_events_s_1     (acquires mutex A)
+Thread 2: append t_logs_s_1       (acquires mutex B)  ← No blocking
+Thread 3: append t_events_s_1     (waits for mutex A)  ← Blocks
+```
+
+### Lock Acquisition Order
+
+All write operations follow the same lock order to prevent deadlocks:
+
+1. **Read Lock** on `active_leases` (lease check)
+2. **Read Lock** on `write_locks` (mutex lookup)
+3. **Mutex** for specific WAL key (write serialization)
+
+No operation holds multiple per-key mutexes simultaneously.
+
+## Performance Characteristics
+
+### Append Latency
+
+Dominated by Walrus I/O:
+- **Fast Path**: ~100-200μs (SSD with io_uring)
+- **Lease Check**: ~1-5μs (in-memory hash set lookup)
+- **Lock Contention**: Minimal unless concurrent writes to same key
+
+### Read Latency
+
+- **Cache Hit**: ~50-100μs
+- **Cache Miss**: ~200-500μs (depends on storage)
+- **No Lease Overhead**: Reads don't check leases
+
+### Lease Update
+
+- **Fast Path** (no changes): ~1-10μs (read lock only)
+- **Slow Path** (changes): ~10-50μs (write lock + hash set ops)
+
+### Memory Usage
+
+- **Per-Key Overhead**: ~80 bytes (String + Arc&lt;Mutex&lt;()&gt;&gt;)
+- **Lease Set**: ~50 bytes per active lease
+- **Typical**: 1-10 KB for small clusters
+
+## Error Handling
+
+<AccordionGroup>
+  <Accordion title="NotLeaderForPartition">
+    **Cause**: Attempted write without holding a lease for the WAL key.
+    
+    **Resolution**: Controller should re-check metadata and forward to correct leader.
+    
+    **Log Example**: `write rejected for t_events_s_1 (leases: {:?})`
+  </Accordion>
+  
+  <Accordion title="Walrus I/O Errors">
+    **Causes**: Disk full, file corruption, permission issues
+    
+    **Propagation**: Returned directly from `append_by_key` or `read_one`
+    
+    **Recovery**: Depends on error type (may require operator intervention)
+  </Accordion>
+  
+  <Accordion title="Lock Poisoning">
+    **Cause**: Panic while holding a lock (rare)
+    
+    **Handling**: RwLock poisoning is caught and converted to `None` in controller
+    
+    **Impact**: Affects single operation, not entire system
+  </Accordion>
+</AccordionGroup>
+
+## Integration Points
+
+### With NodeController
+
+The controller manages the lease lifecycle:
+
+```rust
+// Controller determines expected leases from metadata
+let expected: HashSet<String> = metadata
+    .owned_topics(node_id)
+    .into_iter()
+    .map(|(topic, seg)| wal_key(&topic, seg))
+    .collect();
+
+// Storage enforces the lease set
+bucket.update_leases(&expected).await;
+
+// Now writes to expected keys will succeed
+bucket.append_by_key("t_events_s_1", data).await?;
+```
+
+### With Walrus Engine
+
+`Storage` delegates I/O to Walrus:
+- **Namespacing**: All keys scoped to `DATA_NAMESPACE`
+- **Batching**: Uses `batch_append_for_topic` for efficiency
+- **Cursors**: Walrus maintains read cursors automatically
+- **Durability**: Walrus handles fsync and crash recovery
+
+## Monitoring
+
+### Recommended Metrics
+
+<ResponseField name="active_lease_count" type="gauge">
+  Number of WAL keys this node currently holds leases for. Should match metadata's `owned_topics` count.
+</ResponseField>
+
+<ResponseField name="lease_update_duration" type="histogram">
+  Time spent in `update_leases()`. Spikes indicate contention or large lease set changes.
+</ResponseField>
+
+<ResponseField name="append_duration" type="histogram">
+  End-to-end append latency including lease check and Walrus I/O.
+</ResponseField>
+
+<ResponseField name="lease_rejection_count" type="counter">
+  Number of write attempts rejected due to missing lease. High values indicate routing issues.
+</ResponseField>
+
+### Debug Logging
+
+Enable with `RUST_LOG=walrus::bucket=debug`:
+
+```
+write rejected for t_events_s_1 (leases: {"t_logs_s_1", "t_metrics_s_1"})
+update_leases: added t_events_s_1, removed t_logs_s_2
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Lease Update Frequency">
+    The default 100ms interval balances responsiveness and overhead. Increase if CPU-bound, decrease if faster failover needed.
+  </Accordion>
+  
+  <Accordion title="Environment Variables">
+    Always set `WALRUS_DISABLE_IO_URING=1` in Docker/Kubernetes. io_uring often unavailable in containers.
+  </Accordion>
+  
+  <Accordion title="Storage Directory">
+    Use dedicated volume with sufficient IOPS. Walrus performance directly impacts throughput.
+  </Accordion>
+  
+  <Accordion title="Lease Debugging">
+    Log lease rejections at WARN level. They indicate metadata/lease desync (usually transient during leadership changes).
+  </Accordion>
+</AccordionGroup>
+
+## Testing Hooks
+
+The `TestControl` RPC provides lease manipulation for testing:
+
+```rust
+// Revoke all leases for a topic (simulates leadership loss)
+TestControl::RevokeLeases { topic: "events" }
+
+// Force lease resync (useful after metadata changes)
+TestControl::SyncLeases
+```
+
+## Related Components
+
+- [NodeController](/api/node-controller) - Determines lease assignments based on metadata
+- [Metadata](/api/metadata) - Source of truth for topic ownership

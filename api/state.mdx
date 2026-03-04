@@ -1,0 +1,302 @@
+---
+title: STATE Command
+description: Get topic metadata and segment information as JSON
+---
+
+The `STATE` command returns detailed metadata about a topic, including its segments, leaders, entry counts, and cursor position.
+
+## Syntax
+
+```
+STATE <topic>
+```
+
+<ParamField path="topic" type="string" required>
+  The name of the topic to inspect. Must be a single word (no spaces).
+</ParamField>
+
+## Wire Format
+
+**Request:**
+```
+[4 bytes: length] STATE <topic>
+```
+
+**Success Response:**
+```
+[4 bytes: length] OK <json_payload>
+```
+
+Note: The response is `OK` followed by a space and the JSON payload (not just the JSON).
+
+**Error Response:**
+```
+[4 bytes: length] ERR <error message>
+```
+
+## Response Format
+
+The JSON response contains:
+
+```json
+{
+  "topic": "logs",
+  "segments": [
+    {
+      "segment_id": 0,
+      "leader_node": 1,
+      "sealed": false,
+      "entry_count": 42
+    },
+    {
+      "segment_id": 1,
+      "leader_node": 2,
+      "sealed": true,
+      "entry_count": 1000050
+    }
+  ],
+  "cursor_position": 15,
+  "total_entries": 1000092
+}
+```
+
+### Response Fields
+
+<ParamField path="topic" type="string">
+  The name of the topic
+</ParamField>
+
+<ParamField path="segments" type="array">
+  List of all segments for this topic
+  
+  <ParamField path="segment_id" type="integer">
+    Zero-based segment identifier
+  </ParamField>
+  
+  <ParamField path="leader_node" type="integer">
+    Node ID that owns this segment (handles writes if active, reads if sealed)
+  </ParamField>
+  
+  <ParamField path="sealed" type="boolean">
+    Whether the segment is sealed (read-only) or active (accepting writes)
+  </ParamField>
+  
+  <ParamField path="entry_count" type="integer">
+    Number of entries in this segment
+  </ParamField>
+</ParamField>
+
+<ParamField path="cursor_position" type="integer">
+  Current shared cursor position (next entry to be read by GET)
+</ParamField>
+
+<ParamField path="total_entries" type="integer">
+  Total number of entries across all segments
+</ParamField>
+
+## Examples
+
+### Interactive Shell
+
+```bash
+🦭 > REGISTER logs
+OK
+
+🦭 > STATE logs
+{
+  "topic": "logs",
+  "segments": [
+    {
+      "segment_id": 0,
+      "leader_node": 1,
+      "sealed": false,
+      "entry_count": 0
+    }
+  ],
+  "cursor_position": 0,
+  "total_entries": 0
+}
+
+🦭 > PUT logs "hello"
+OK
+
+🦭 > STATE logs
+{
+  "topic": "logs",
+  "segments": [
+    {
+      "segment_id": 0,
+      "leader_node": 1,
+      "sealed": false,
+      "entry_count": 1
+    }
+  ],
+  "cursor_position": 0,
+  "total_entries": 1
+}
+
+🦭 > GET logs
+OK hello
+
+🦭 > STATE logs
+{
+  "topic": "logs",
+  "segments": [
+    {
+      "segment_id": 0,
+      "leader_node": 1,
+      "sealed": false,
+      "entry_count": 1
+    }
+  ],
+  "cursor_position": 1,
+  "total_entries": 1
+}
+```
+
+### One-off Command
+
+```bash
+# Get topic state
+cargo run --bin walrus-cli -- state logs
+
+# Pretty-print JSON with jq
+cargo run --bin walrus-cli -- state logs | jq .
+
+# Extract specific fields
+cargo run --bin walrus-cli -- state logs | jq '.total_entries'
+cargo run --bin walrus-cli -- state logs | jq '.segments[].leader_node'
+```
+
+### Programmatic Usage (Rust)
+
+```rust
+use distributed_walrus::cli_client::CliClient;
+use serde_json::Value;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let client = CliClient::new("127.0.0.1:9091");
+    
+    // Get state as JSON string
+    let state_json = client.state("logs").await?;
+    
+    // Parse JSON
+    let state: Value = serde_json::from_str(&state_json)?;
+    println!("Total entries: {}", state["total_entries"]);
+    println!("Cursor position: {}", state["cursor_position"]);
+    
+    Ok(())
+}
+```
+
+## Use Cases
+
+### Monitor Topic Growth
+
+```bash
+# Watch topic size grow
+watch -n 1 'cargo run --bin walrus-cli -- state logs | jq .total_entries'
+```
+
+### Check Segment Distribution
+
+```bash
+# List all segments and their leaders
+cargo run --bin walrus-cli -- state logs | jq '.segments[] | "Segment \(.segment_id): Node \(.leader_node) (\(.entry_count) entries)"'
+```
+
+### Verify Rollover
+
+```bash
+# Check if rollover has occurred (multiple segments)
+cargo run --bin walrus-cli -- state logs | jq '.segments | length'
+```
+
+### Track Consumer Progress
+
+```bash
+# Calculate lag (unread entries)
+cargo run --bin walrus-cli -- state logs | jq '.total_entries - .cursor_position'
+```
+
+## Error Cases
+
+### Missing Topic Name
+
+**Request:**
+```
+STATE
+```
+
+**Response:**
+```
+ERR STATE requires a topic
+```
+
+### Topic Does Not Exist
+
+**Request:**
+```
+STATE nonexistent
+```
+
+**Response:**
+```
+ERR topic not found
+```
+
+## Understanding Segments
+
+### Active Segment
+
+The newest segment with `sealed: false`:
+- Accepts new PUT operations
+- Has a designated leader node
+- Entry count grows as data is written
+- Becomes sealed when it reaches ~1M entries
+
+### Sealed Segments
+
+Older segments with `sealed: true`:
+- Read-only (no more writes)
+- Entry count is fixed
+- Original leader retains the data for reads
+- Can be read from any replica with the data
+
+### Leadership Rotation
+
+Each segment has a different leader:
+```json
+{
+  "segments": [
+    {"segment_id": 0, "leader_node": 1, "sealed": true},
+    {"segment_id": 1, "leader_node": 2, "sealed": true},
+    {"segment_id": 2, "leader_node": 3, "sealed": false}
+  ]
+}
+```
+
+Leadership rotates round-robin on segment rollover for automatic load distribution.
+
+## Metadata Consistency
+
+### Replicated State
+
+- Topic metadata is replicated via Raft across all nodes
+- Any node can answer STATE queries
+- Consistent view of segments and leaders
+- Updates happen through Raft consensus
+
+### Eventually Consistent
+
+- Slight delays during metadata updates (100ms sync loop)
+- Entry counts may be stale by a few entries
+- Cursor position reflects local view
+
+## Related Commands
+
+- [REGISTER](/api/register) - Create a topic to inspect
+- [PUT](/api/put) - Append data to increase entry count
+- [GET](/api/get) - Advance cursor position
+- [METRICS](/api/metrics) - View cluster-wide Raft metrics

@@ -1,0 +1,190 @@
+---
+title: "ReadConsistency"
+description: "Read consistency model for controlling durability vs. performance trade-offs"
+---
+
+The `ReadConsistency` enum controls how read positions are persisted to disk, allowing you to choose between strict exactly-once semantics and higher-throughput at-least-once delivery.
+
+## Enum Definition
+
+```rust
+pub enum ReadConsistency {
+    StrictlyAtOnce,
+    AtLeastOnce { persist_every: u32 },
+}
+```
+
+## Variants
+
+### StrictlyAtOnce
+
+Persists every read checkpoint immediately to disk.
+
+```rust
+ReadConsistency::StrictlyAtOnce
+```
+
+**Guarantees:**
+- Exactly-once read semantics
+- Every consumed entry is durably marked as read
+- No entries are replayed after a crash
+
+**Performance:**
+- Lower throughput due to frequent persistence
+- More disk I/O for checkpoint updates
+
+**Use Cases:**
+- Financial transactions
+- Critical event processing where duplicate processing is unacceptable
+- Systems requiring strict consistency guarantees
+
+**Example:**
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce)?;
+wal.append_for_topic("orders", b"order-123")?;
+
+// Read position is persisted immediately
+let entry = wal.read_next("orders", true)?.unwrap();
+// If crash happens here, entry will NOT be replayed
+```
+
+### AtLeastOnce
+
+Persists read checkpoints every N entries.
+
+```rust
+ReadConsistency::AtLeastOnce { persist_every: u32 }
+```
+
+<ParamField path="persist_every" type="u32" required>
+  Number of entries to consume before persisting the checkpoint to disk. Must be ≥ 1.
+</ParamField>
+
+**Guarantees:**
+- At-least-once read semantics
+- Up to N entries may be replayed after a crash
+- Higher throughput with controlled replay window
+
+**Performance:**
+- Higher read throughput
+- Reduced disk I/O for checkpoints
+- Batches checkpoint persistence
+
+**Use Cases:**
+- Event streaming where duplicate processing is acceptable
+- Analytics pipelines with idempotent consumers
+- High-throughput systems prioritizing performance over strict ordering
+
+**Example:**
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+// Persist checkpoint every 1000 reads
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 }
+)?;
+
+// Write 2000 entries
+for i in 0..2000 {
+    wal.append_for_topic("events", format!("event-{}", i).as_bytes())?;
+}
+
+// Read 1500 entries
+for _ in 0..1500 {
+    let _ = wal.read_next("events", true)?;
+}
+
+// Only 1 checkpoint was persisted (at entry 1000)
+// If crash happens here, entries 1001-1500 will be replayed
+```
+
+## Choosing a Consistency Model
+
+| Requirement | Recommended Model |
+|-------------|------------------|
+| No duplicate processing allowed | `StrictlyAtOnce` |
+| Maximum read throughput | `AtLeastOnce` with high `persist_every` |
+| Idempotent consumers | `AtLeastOnce` |
+| Financial/critical operations | `StrictlyAtOnce` |
+| Event streaming | `AtLeastOnce` |
+| Minimize crash recovery time | `AtLeastOnce` with low `persist_every` |
+
+## Replay Window Calculation
+
+With `AtLeastOnce { persist_every: N }`:
+
+- **Maximum entries replayed:** N entries
+- **Actual entries replayed:** `(total_consumed % N)`
+- **Replay window size:** Depends on entry size and throughput
+
+**Example:**
+
+```rust
+// persist_every: 100
+// Total consumed: 350 entries
+// Checkpoints persisted at: 100, 200, 300
+// Entries replayed after crash: 50 (entries 301-350)
+```
+
+## Behavior with Batch Operations
+
+Both `read_next()` and `batch_read_for_topic()` respect the consistency model:
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 100 }
+)?;
+
+// Batch read of 50 entries - checkpoint NOT persisted (under threshold)
+let entries = wal.batch_read_for_topic("topic", 1024 * 1024, true, None)?;
+
+// Batch read of 150 entries - checkpoint IS persisted (exceeds threshold)
+let entries = wal.batch_read_for_topic("topic", 1024 * 1024, true, None)?;
+```
+
+## Configuration Examples
+
+### Maximum Durability
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::SyncEach
+)?;
+```
+
+### Balanced Performance
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 100 },
+    FsyncSchedule::Milliseconds(200)
+)?;
+```
+
+### Maximum Throughput
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 10000 },
+    FsyncSchedule::Milliseconds(1000)
+)?;
+```
+
+## Related Types
+
+- [Walrus](/api/walrus) - Main WAL instance
+- [FsyncSchedule](/api/fsync-schedule) - Controls when writes are flushed to disk
+- [Entry (WalEntry)](/api/wal-entry) - Structure returned by read operations

@@ -1,0 +1,436 @@
+---
+title: "Walrus"
+description: "Main WAL instance for managing topic-based write-ahead logging"
+---
+
+The `Walrus` struct is the main entry point for the Walrus Write-Ahead Log library. It provides high-performance concurrent read and write operations with configurable consistency models and fsync scheduling.
+
+## Constructors
+
+### new()
+
+Creates a new Walrus instance with default settings.
+
+```rust
+pub fn new() -> std::io::Result<Self>
+```
+
+**Default Configuration:**
+- Read consistency: `StrictlyAtOnce`
+- Fsync schedule: `Milliseconds(200)`
+- Data directory: `./wal_files` (or `WALRUS_DATA_DIR` env var)
+
+**Example:**
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+```
+
+### with_consistency()
+
+Creates a Walrus instance with a custom read consistency model.
+
+```rust
+pub fn with_consistency(mode: ReadConsistency) -> std::io::Result<Self>
+```
+
+<ParamField path="mode" type="ReadConsistency" required>
+  The read consistency model to use (StrictlyAtOnce or AtLeastOnce)
+</ParamField>
+
+**Example:**
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 }
+)?;
+```
+
+### with_consistency_and_schedule()
+
+Creates a Walrus instance with custom consistency and fsync scheduling.
+
+```rust
+pub fn with_consistency_and_schedule(
+    mode: ReadConsistency,
+    fsync_schedule: FsyncSchedule,
+) -> std::io::Result<Self>
+```
+
+<ParamField path="mode" type="ReadConsistency" required>
+  The read consistency model to use
+</ParamField>
+
+<ParamField path="fsync_schedule" type="FsyncSchedule" required>
+  When to flush data to disk (Milliseconds, SyncEach, or NoFsync)
+</ParamField>
+
+**Example:**
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::Milliseconds(500)
+)?;
+```
+
+### new_for_key()
+
+Creates a namespaced Walrus instance with a separate storage directory.
+
+```rust
+pub fn new_for_key(key: &str) -> std::io::Result<Self>
+```
+
+<ParamField path="key" type="&str" required>
+  Namespace identifier (creates a subdirectory under `wal_files/<sanitized-key>/`)
+</ParamField>
+
+**Example:**
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new_for_key("tenant-123")?;
+```
+
+### with_consistency_for_key()
+
+Creates a namespaced Walrus instance with custom consistency.
+
+```rust
+pub fn with_consistency_for_key(key: &str, mode: ReadConsistency) -> std::io::Result<Self>
+```
+
+<ParamField path="key" type="&str" required>
+  Namespace identifier
+</ParamField>
+
+<ParamField path="mode" type="ReadConsistency" required>
+  The read consistency model to use
+</ParamField>
+
+### with_consistency_and_schedule_for_key()
+
+Creates a namespaced Walrus instance with full custom configuration.
+
+```rust
+pub fn with_consistency_and_schedule_for_key(
+    key: &str,
+    mode: ReadConsistency,
+    fsync_schedule: FsyncSchedule,
+) -> std::io::Result<Self>
+```
+
+<ParamField path="key" type="&str" required>
+  Namespace identifier
+</ParamField>
+
+<ParamField path="mode" type="ReadConsistency" required>
+  The read consistency model to use
+</ParamField>
+
+<ParamField path="fsync_schedule" type="FsyncSchedule" required>
+  When to flush data to disk
+</ParamField>
+
+### builder()
+
+Returns a `WalrusBuilder` for explicit configuration.
+
+```rust
+pub fn builder() -> WalrusBuilder
+```
+
+**Recommended** when multiple threads need to create instances with different data directories to avoid race conditions with the `WALRUS_DATA_DIR` environment variable.
+
+**Example:**
+
+```rust
+use walrus_rust::Walrus;
+use std::path::PathBuf;
+
+let wal = Walrus::builder()
+    .data_dir(PathBuf::from("/var/lib/myapp/wal"))
+    .key("tenant-123")
+    .build()?;
+```
+
+## Write Operations
+
+### append_for_topic()
+
+Appends a single entry to a topic.
+
+```rust
+pub fn append_for_topic(&self, col_name: &str, raw_bytes: &[u8]) -> std::io::Result<()>
+```
+
+<ParamField path="col_name" type="&str" required>
+  The topic name to append to
+</ParamField>
+
+<ParamField path="raw_bytes" type="&[u8]" required>
+  The data bytes to append
+</ParamField>
+
+**Example:**
+
+```rust
+wal.append_for_topic("my-topic", b"Hello, Walrus!")?;
+```
+
+### batch_append_for_topic()
+
+Atomically appends multiple entries to a topic (all-or-nothing).
+
+```rust
+pub fn batch_append_for_topic(&self, col_name: &str, batch: &[&[u8]]) -> std::io::Result<()>
+```
+
+<ParamField path="col_name" type="&str" required>
+  The topic name to append to
+</ParamField>
+
+<ParamField path="batch" type="&[&[u8]]" required>
+  Slice of byte slices to append atomically (max 2,000 entries, ~10GB total)
+</ParamField>
+
+**Batch Limits:**
+- Maximum 2,000 entries per batch
+- Maximum ~10GB total payload per batch
+
+**Performance:**
+- On Linux with FD backend: Uses io_uring for parallel I/O
+- Other platforms or mmap backend: Sequential operations
+
+**Example:**
+
+```rust
+let batch = vec![
+    b"entry 1".as_slice(),
+    b"entry 2".as_slice(),
+    b"entry 3".as_slice(),
+];
+wal.batch_append_for_topic("events", &batch)?;
+```
+
+## Read Operations
+
+### read_next()
+
+Reads the next entry from a topic.
+
+```rust
+pub fn read_next(&self, col_name: &str, checkpoint: bool) -> std::io::Result<Option<Entry>>
+```
+
+<ParamField path="col_name" type="&str" required>
+  The topic name to read from
+</ParamField>
+
+<ParamField path="checkpoint" type="bool" required>
+  - `true`: Consume the entry (advances read position)
+  - `false`: Peek at the entry without consuming
+</ParamField>
+
+<ResponseField name="return" type="std::io::Result<Option<Entry>>">
+  - `Ok(Some(entry))`: Entry was read successfully
+  - `Ok(None)`: No more entries available
+  - `Err(e)`: I/O error occurred
+</ResponseField>
+
+**Example:**
+
+```rust
+// Read and consume
+if let Some(entry) = wal.read_next("my-topic", true)? {
+    println!("Read: {:?}", String::from_utf8_lossy(&entry.data));
+}
+
+// Peek without consuming
+if let Some(entry) = wal.read_next("my-topic", false)? {
+    println!("Peeking: {:?}", String::from_utf8_lossy(&entry.data));
+}
+```
+
+### batch_read_for_topic()
+
+Reads multiple entries from a topic up to a byte limit.
+
+```rust
+pub fn batch_read_for_topic(
+    &self,
+    col_name: &str,
+    max_bytes: usize,
+    checkpoint: bool,
+    start_offset: Option<u64>,
+) -> std::io::Result<Vec<Entry>>
+```
+
+<ParamField path="col_name" type="&str" required>
+  The topic name to read from
+</ParamField>
+
+<ParamField path="max_bytes" type="usize" required>
+  Maximum bytes to read (returns at least 1 entry if available)
+</ParamField>
+
+<ParamField path="checkpoint" type="bool" required>
+  - `true`: Consume entries (advances read position)
+  - `false`: Peek at entries without consuming
+</ParamField>
+
+<ParamField path="start_offset" type="Option<u64>">
+  - `None`: Stateful read from current position
+  - `Some(offset)`: Stateless read from specific byte offset
+</ParamField>
+
+<ResponseField name="return" type="std::io::Result<Vec<Entry>>">
+  Vector of entries read (may be empty if none available)
+</ResponseField>
+
+**Performance:**
+- On Linux with FD backend: Uses io_uring for parallel I/O
+- Enforces max 2,000 entries per call
+
+**Example:**
+
+```rust
+// Read up to 1MB
+let max_bytes = 1024 * 1024;
+let entries = wal.batch_read_for_topic("events", max_bytes, true, None)?;
+for entry in entries {
+    println!("Read: {} bytes", entry.data.len());
+}
+```
+
+## Topic Management
+
+### mark_topic_dirty()
+
+Marks a topic as having uncommitted changes.
+
+```rust
+pub fn mark_topic_dirty(&self, topic: &str)
+```
+
+<ParamField path="topic" type="&str" required>
+  The topic name to mark as dirty
+</ParamField>
+
+### mark_topic_clean()
+
+Marks a topic as having all changes committed.
+
+```rust
+pub fn mark_topic_clean(&self, topic: &str)
+```
+
+<ParamField path="topic" type="&str" required>
+  The topic name to mark as clean
+</ParamField>
+
+### topic_is_clean()
+
+Checks if a topic has uncommitted changes.
+
+```rust
+pub fn topic_is_clean(&self, topic: &str) -> bool
+```
+
+<ParamField path="topic" type="&str" required>
+  The topic name to check
+</ParamField>
+
+<ResponseField name="return" type="bool">
+  `true` if topic is clean, `false` if dirty
+</ResponseField>
+
+### get_topic_entry_count()
+
+Gets the number of unread entries for a topic.
+
+```rust
+pub fn get_topic_entry_count(&self, topic: &str) -> u64
+```
+
+<ParamField path="topic" type="&str" required>
+  The topic name to query
+</ParamField>
+
+<ResponseField name="return" type="u64">
+  Number of entries available to read (0 if none or topic doesn't exist)
+</ResponseField>
+
+### get_topic_entry_counts()
+
+Gets entry counts for all topics.
+
+```rust
+pub fn get_topic_entry_counts(&self) -> HashMap<String, u64>
+```
+
+<ResponseField name="return" type="HashMap<String, u64>">
+  Map of topic names to their unread entry counts
+</ResponseField>
+
+### get_topic_size()
+
+Gets the total byte size of a topic (sealed + active blocks).
+
+```rust
+pub fn get_topic_size(&self, topic: &str) -> u64
+```
+
+<ParamField path="topic" type="&str" required>
+  The topic name to query
+</ParamField>
+
+<ResponseField name="return" type="u64">
+  Total bytes used by the topic (0 if topic doesn't exist)
+</ResponseField>
+
+## Backend Control
+
+### enable_fd_backend()
+
+Enables the FD (file descriptor) backend with pread/pwrite.
+
+```rust
+pub fn enable_fd_backend()
+```
+
+**Note:** Must be called before creating any Walrus instances.
+
+**Features:**
+- Uses io_uring on Linux for batch operations
+- Opens files with O_SYNC when `FsyncSchedule::SyncEach` is used
+
+### disable_fd_backend()
+
+Disables the FD backend and uses memory-mapped files instead.
+
+```rust
+pub fn disable_fd_backend()
+```
+
+**Note:** Must be called before creating any Walrus instances.
+
+**Features:**
+- Uses memory-mapped files
+- Batch operations fall back to sequential reads/writes
+- Works on all platforms
+
+## Related Types
+
+- [Entry (WalEntry)](/api/wal-entry) - Structure returned by read operations
+- [ReadConsistency](/api/read-consistency) - Consistency model configuration
+- [FsyncSchedule](/api/fsync-schedule) - Fsync timing configuration
+- WalrusBuilder - Builder pattern for instance creation

@@ -1,0 +1,247 @@
+---
+title: GET Command
+description: Read the next entry from a topic's shared cursor
+---
+
+The `GET` command reads a single entry from a topic and advances a shared cursor. Multiple clients reading from the same topic share the cursor position.
+
+## Syntax
+
+```
+GET <topic>
+```
+
+<ParamField path="topic" type="string" required>
+  The name of the topic to read from. Must be a single word (no spaces).
+</ParamField>
+
+## Wire Format
+
+**Request:**
+```
+[4 bytes: length] GET <topic>
+```
+
+**Success Response (with data):**
+```
+[4 bytes: length] OK <payload>
+```
+
+**Success Response (empty):**
+```
+[4 bytes: 5] EMPTY
+```
+
+**Error Response:**
+```
+[4 bytes: length] ERR <error message>
+```
+
+## Behavior
+
+### Shared Cursor
+
+The GET command uses a **shared cursor** model:
+- Single cursor position per topic (not per client)
+- Each GET advances the cursor by one entry
+- Multiple clients reading from the same topic share the cursor
+- No consumer groups or independent cursors (current limitation)
+- Cursor state is maintained in memory (not persisted)
+
+### Read Path
+
+1. Client sends GET to any node
+2. Node looks up the current segment for the cursor position
+3. Request is routed to a node that has the segment data
+4. Entry is read from the Walrus WAL
+5. Cursor is advanced by one position
+6. Data is returned to the client
+
+### Sealed Segment Reads
+
+- Old segments can be read from any replica that has the data
+- No requirement to read from the original leader
+- Reads scale with replicas for historical data
+- Active segment reads go through the current leader
+
+### Empty Topics
+
+When no data is available:
+- Returns `EMPTY` (not an error)
+- Cursor position unchanged
+- Subsequent PUTs make data available for next GET
+
+## Examples
+
+### Interactive Shell
+
+```bash
+🦭 > REGISTER logs
+OK
+
+🦭 > PUT logs "first message"
+OK
+
+🦭 > PUT logs "second message"
+OK
+
+🦭 > GET logs
+OK first message
+
+🦭 > GET logs
+OK second message
+
+🦭 > GET logs
+EMPTY
+```
+
+### One-off Command
+
+```bash
+# Read next entry
+cargo run --bin walrus-cli -- get logs
+
+# Read from specific node
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9092 get logs
+
+# Read in a loop until empty
+while true; do
+    result=$(cargo run --bin walrus-cli -- get logs 2>/dev/null)
+    if [[ "$result" == "EMPTY" ]]; then
+        echo "No more data"
+        break
+    fi
+    echo "$result"
+done
+```
+
+### Programmatic Usage (Rust)
+
+```rust
+use distributed_walrus::cli_client::CliClient;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let client = CliClient::new("127.0.0.1:9091");
+    
+    // Read entries until empty
+    loop {
+        match client.get("logs").await? {
+            Some(data) => println!("Read: {}", data),
+            None => {
+                println!("No more data");
+                break;
+            }
+        }
+    }
+    
+    Ok(())
+}
+```
+
+## Error Cases
+
+### Missing Topic Name
+
+**Request:**
+```
+GET
+```
+
+**Response:**
+```
+ERR GET requires a topic
+```
+
+### Topic Does Not Exist
+
+**Request:**
+```
+GET nonexistent
+```
+
+**Response:**
+```
+ERR topic not found
+```
+
+### Cluster Errors
+
+- **Raft not ready**: `ERR raft cluster not initialized`
+- **Connection timeout**: Connection refused or timeout
+- **Node unavailable**: Try connecting to a different node
+
+## Shared Cursor Behavior
+
+### Multiple Clients
+
+```bash
+# Client 1
+🦭 > GET logs
+OK message 1
+
+# Client 2 (connects to same cluster)
+🦭 > GET logs
+OK message 2  # Cursor was already advanced by Client 1
+
+# Client 1 again
+🦭 > GET logs
+OK message 3  # Continues from where Client 2 left off
+```
+
+### Cursor Reset
+
+Currently, there is **no way to reset the cursor** or seek to a specific position:
+- Cursor starts at position 0 when the topic is created
+- Each GET advances by one entry
+- Restarting the cluster resets cursors (in-memory only)
+
+### Limitations
+
+- No per-client cursors
+- No consumer groups
+- No offset commits or checkpointing
+- No seek to specific offset
+- Cursor state not persisted (lost on cluster restart)
+
+## Performance Considerations
+
+### Read Throughput
+
+- One entry per GET request
+- No batch read support
+- Latency: ~1 RTT for local reads + storage latency
+- Sealed segments can be read from any replica
+
+### Cursor Management
+
+- Cursor state maintained in memory
+- No disk I/O for cursor updates
+- Cursor position lost on cluster restart
+- Single shared cursor per topic (no contention)
+
+## Data Guarantees
+
+### Ordering
+
+- Entries are read in the order they were written
+- Guaranteed per-topic ordering
+- Monotonically increasing offsets
+
+### Consistency
+
+- Read-your-writes not guaranteed (shared cursor)
+- Eventually consistent reads from sealed segments
+- Strong consistency for active segment reads
+
+### Durability
+
+- Reads return committed data from Walrus WAL
+- Data persisted to disk before acknowledgment
+- Cursor position not durable (in-memory)
+
+## Related Commands
+
+- [PUT](/api/put) - Append data to read later
+- [STATE](/api/state) - View current cursor position and entry count
+- [REGISTER](/api/register) - Create a topic before reading

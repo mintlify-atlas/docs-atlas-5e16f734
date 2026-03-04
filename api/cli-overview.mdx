@@ -1,0 +1,125 @@
+---
+title: CLI Overview
+description: Overview of the Walrus CLI client protocol and connection setup
+---
+
+The Walrus CLI is a lightweight client for interacting with a distributed Walrus cluster over TCP. It supports both interactive shell mode and one-off commands.
+
+## Connection Setup
+
+The CLI connects to any node in the cluster via TCP on the client port (default: `9091`). The cluster automatically routes requests to the appropriate leader node.
+
+```bash
+# Connect to default address (127.0.0.1:9091)
+cargo run --bin walrus-cli
+
+# Connect to specific node
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9092
+```
+
+<ParamField path="--addr" type="string" default="127.0.0.1:9091">
+  Address of the client listener in the format `HOST:PORT`
+</ParamField>
+
+## Wire Format
+
+The CLI uses a simple length-prefixed text protocol over TCP:
+
+```
+[4 bytes: length (little-endian)] [UTF-8 command]
+```
+
+### Request Structure
+
+1. **Length prefix**: 4 bytes (u32) in little-endian byte order representing the command length
+2. **Command payload**: UTF-8 encoded command string
+
+### Response Structure
+
+1. **Length prefix**: 4 bytes (u32) in little-endian byte order representing the response length
+2. **Response payload**: UTF-8 encoded response string
+
+### Response Types
+
+- `OK` - Success with no payload
+- `OK [payload]` - Success with data payload
+- `EMPTY` - No data available (GET command only)
+- `ERR <message>` - Error with descriptive message
+
+### Frame Limits
+
+- Minimum frame length: 1 byte
+- Maximum frame length: 64 KB (65,536 bytes)
+- Invalid frame lengths return `ERR invalid frame length`
+
+## Usage Modes
+
+### Interactive Shell (REPL)
+
+Start the CLI without a subcommand to enter interactive mode:
+
+```bash
+cargo run --bin walrus-cli
+```
+
+The shell provides:
+- Command history
+- Tab completion
+- Exit with `exit`, `quit`, `q`, or Ctrl+C
+- Direct command input without prefixes
+
+```
+🦭 > REGISTER logs
+OK
+🦭 > PUT logs "hello world"
+OK
+🦭 > GET logs
+hello world
+🦭 > exit
+```
+
+### One-off Commands
+
+Execute single commands using subcommands:
+
+```bash
+# Register a topic
+cargo run --bin walrus-cli -- register logs
+
+# Append data
+cargo run --bin walrus-cli -- put logs "hello world"
+
+# Read data
+cargo run --bin walrus-cli -- get logs
+
+# Get topic state
+cargo run --bin walrus-cli -- state logs
+
+# Get metrics
+cargo run --bin walrus-cli -- metrics
+```
+
+## Available Commands
+
+The CLI supports five commands:
+
+- **[REGISTER](/api/register)** - Create a topic if it doesn't exist
+- **[PUT](/api/put)** - Append data to a topic
+- **[GET](/api/get)** - Read the next entry from a topic
+- **[STATE](/api/state)** - Get topic metadata as JSON
+- **[METRICS](/api/metrics)** - Get Raft metrics as JSON
+
+## Error Handling
+
+- Connection failures return context about the connection attempt
+- Invalid UTF-8 encoding returns `ERR invalid utf-8`
+- Unknown commands return `ERR unknown command`
+- Command-specific errors include descriptive messages
+- Non-zero exit codes for failures in one-off mode
+
+## Cluster Integration
+
+- Connect to **any node** in the cluster
+- Non-leader nodes automatically forward requests to the leader
+- Sealed segments can be read from any replica
+- Transparent failover during leadership changes

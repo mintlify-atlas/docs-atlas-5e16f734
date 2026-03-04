@@ -1,0 +1,144 @@
+---
+title: REGISTER Command
+description: Create a topic in the distributed Walrus cluster
+---
+
+The `REGISTER` command creates a new topic if it doesn't already exist. This operation is idempotent - registering an existing topic succeeds without error.
+
+## Syntax
+
+```
+REGISTER <topic>
+```
+
+<ParamField path="topic" type="string" required>
+  The name of the topic to register. Must be a single word (no spaces).
+</ParamField>
+
+## Wire Format
+
+**Request:**
+```
+[4 bytes: length] REGISTER <topic>
+```
+
+**Success Response:**
+```
+[4 bytes: 2] OK
+```
+
+**Error Response:**
+```
+[4 bytes: length] ERR <error message>
+```
+
+## Behavior
+
+### Topic Creation
+
+1. The request is routed to the Raft leader
+2. A new topic entry is proposed to the Raft cluster
+3. Once committed, the topic metadata is replicated to all nodes
+4. The first segment (segment 0) is created with an assigned leader node
+5. Leadership for the topic rotates round-robin as segments roll over
+
+### Idempotency
+
+Registering an existing topic returns `OK` without modification:
+- No duplicate topics are created
+- Existing segment assignments remain unchanged
+- Safe to call multiple times
+
+## Examples
+
+### Interactive Shell
+
+```bash
+🦭 > REGISTER logs
+OK
+
+🦭 > REGISTER metrics
+OK
+
+🦭 > REGISTER logs
+OK  # Idempotent - succeeds even though topic exists
+```
+
+### One-off Command
+
+```bash
+# Register a topic
+cargo run --bin walrus-cli -- register logs
+
+# Register with custom node address
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9092 register events
+```
+
+### Programmatic Usage (Rust)
+
+```rust
+use distributed_walrus::cli_client::CliClient;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let client = CliClient::new("127.0.0.1:9091");
+    
+    // Register a topic
+    client.register("logs").await?;
+    
+    Ok(())
+}
+```
+
+## Error Cases
+
+### Missing Topic Name
+
+**Request:**
+```
+REGISTER
+```
+
+**Response:**
+```
+ERR REGISTER requires a topic
+```
+
+### Invalid Topic Name
+
+Topic names with spaces are not supported. Use the first word only:
+
+```bash
+# This will create a topic named "my"
+🦭 > REGISTER my topic
+OK
+```
+
+### Cluster Errors
+
+- **Raft not ready**: `ERR raft cluster not initialized`
+- **Connection timeout**: `ERR connect to 127.0.0.1:9091`
+- **Node unavailable**: Connection refused or timeout
+
+## Cluster Behavior
+
+### Request Routing
+
+1. Client connects to any node in the cluster
+2. If the node is not the Raft leader, it forwards the request
+3. Leader commits the topic creation through Raft consensus
+4. Response is returned to the client through the original node
+
+### Metadata Replication
+
+Once a topic is registered:
+- Metadata is replicated to all nodes via Raft
+- All nodes can answer STATE queries for the topic
+- The assigned leader node accepts PUT operations
+- Segment leadership rotates automatically on rollover
+
+## Related Commands
+
+- [PUT](/api/put) - Append data to a registered topic
+- [GET](/api/get) - Read data from a topic
+- [STATE](/api/state) - View topic metadata and segments

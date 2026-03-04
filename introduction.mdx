@@ -1,0 +1,171 @@
+---
+title: Introduction
+description: Overview of Walrus - A distributed message streaming engine built on high-performance log storage
+---
+
+## What is Walrus?
+
+Walrus is a distributed message streaming platform built on a high-performance log storage engine. It provides fault-tolerant streaming with automatic leadership rotation, segment-based partitioning, and Raft consensus for metadata coordination.
+
+<Note>
+Walrus can be used both as a **standalone library** for embedded use cases or as a **distributed cluster** for fault-tolerant streaming at scale.
+</Note>
+
+## Key Features
+
+### Automatic Load Balancing
+Walrus uses segment-based leadership rotation to distribute load across the cluster. Each topic is split into segments (~1M entries each), with leadership rotating round-robin on segment rollover.
+
+### Fault Tolerance
+Built on Raft consensus with 3+ nodes, Walrus ensures metadata consistency and provides automatic failover. The system replicates metadata (not data) via Raft, keeping consensus overhead minimal.
+
+### Simple Client Protocol
+Connect to any node in the cluster - requests are automatically forwarded to the appropriate leader. The length-prefixed text protocol makes integration straightforward.
+
+### Sealed Segments
+When a segment rolls over, it becomes sealed and can be read from any replica. This eliminates data movement during rollover and enables scalable historical reads.
+
+### High-Performance Storage
+The underlying Walrus engine delivers exceptional performance with io_uring on Linux. Benchmarks show competitive throughput with Kafka and significantly better performance than RocksDB.
+
+## Architecture Overview
+
+Walrus operates on a distributed architecture with multiple components:
+
+```
+┌─────────────────────────────────┐
+│    Client Applications          │
+│  (walrus-cli, Python scripts)   │
+└──────────┬──────────────────────┘
+           │
+    TCP    │
+           ▼
+┌──────────────────────────────────┐
+│         Node Cluster             │
+│  ┌────────────────────────────┐  │
+│  │   Node Controller          │  │
+│  │  • Routing Logic           │  │
+│  │  • Lease Management        │  │
+│  └────────────────────────────┘  │
+│  ┌────────────────────────────┐  │
+│  │   Raft Engine (Octopii)    │  │
+│  │  • Metadata Consensus      │  │
+│  └────────────────────────────┘  │
+│  ┌────────────────────────────┐  │
+│  │   Storage Engine           │  │
+│  │  • Walrus WAL              │  │
+│  │  • Lease-based Fencing     │  │
+│  └────────────────────────────┘  │
+└──────────────────────────────────┘
+```
+
+### Core Components
+
+<Steps>
+  <Step title="Node Controller">
+    Routes client requests to appropriate segment leaders and manages write leases synced from cluster metadata every 100ms.
+  </Step>
+  
+  <Step title="Raft Engine">
+    Maintains Raft consensus for metadata changes only (not data). Handles leader election and log replication.
+  </Step>
+  
+  <Step title="Cluster Metadata">
+    Stores topic → segment → leader mappings, sealed segments, and node addresses. Replicated identically across all nodes.
+  </Step>
+  
+  <Step title="Storage Engine">
+    Wraps Walrus engine with lease-based write fencing. Only accepts writes if node holds lease for that segment.
+  </Step>
+</Steps>
+
+## Use Cases
+
+### Event Streaming
+Stream events from multiple producers to consumers with guaranteed ordering within segments. Ideal for event-driven architectures.
+
+### Log Aggregation
+Collect logs from distributed services into topics. Use segment-based partitioning for parallel processing of historical data.
+
+### Message Queuing
+Implement reliable message queues with at-least-once delivery semantics. The persistent read offset tracking ensures messages survive restarts.
+
+### Time-Series Data
+Store time-series metrics with topic-based organization. Each metric type gets its own topic for efficient reads.
+
+### Database Replication
+Use Walrus as a write-ahead log for database replication. The high-performance storage engine handles heavy write loads.
+
+## Consistency Guarantees
+
+Walrus provides strong consistency guarantees:
+
+- **Single Writer per Segment**: Only the designated leader can write to each segment (enforced via lease-based write fencing)
+- **Sequential Write Order**: Entries within each segment maintain strict ordering
+- **No Writes Past Open Segment**: Sealed segments remain immutable after rollover
+- **Read Cursor Bounds**: Cursors never exceed segment boundaries or entry counts
+
+<Note>
+These invariants are formally verified using a TLA+ specification that models segment-based sharding, lease-based write fencing, and cursor advancement.
+</Note>
+
+## Performance Characteristics
+
+### Write Throughput
+- Single writer per segment (lease-based)
+- ~1.2M writes/s average (without fsync)
+- ~5K writes/s average (with fsync enabled)
+
+### Read Throughput
+Scales with replicas for sealed segments. Active segments read from current leader.
+
+### Latency
+~1-2 RTT for forwarded operations + storage latency
+
+### Segment Rollover
+Default threshold: ~1M entries (~100MB depending on payload size)
+
+## Deployment Modes
+
+### Standalone Library
+
+Use Walrus as an embedded library in your Rust application:
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+wal.append_for_topic("my-topic", b"Hello, Walrus!")?;
+```
+
+### Distributed Cluster
+
+Deploy a 3+ node cluster for fault tolerance:
+
+```bash
+# Bootstrap a 3-node cluster
+make cluster-bootstrap
+
+# Interact via CLI
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get a working example running in minutes
+  </Card>
+  
+  <Card title="Installation" icon="download" href="/installation">
+    Install Walrus as a library or deploy a cluster
+  </Card>
+  
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Deep dive into the distributed architecture
+  </Card>
+  
+  <Card title="API Reference" icon="code" href="/api/walrus">
+    Explore the complete API documentation
+  </Card>
+</CardGroup>

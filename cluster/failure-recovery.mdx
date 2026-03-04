@@ -1,0 +1,714 @@
+---
+title: 'Failure Recovery'
+description: 'Node failure scenarios, recovery procedures, and maintaining cluster availability'
+---
+
+## Failure Modes
+
+Distributed Walrus uses Raft consensus to tolerate node failures. Understanding how the system behaves under different failure scenarios is critical for operations.
+
+### Fault Tolerance Overview
+
+<CardGroup cols={3}>
+  <Card title="3-Node Cluster" icon="server">
+    **Tolerates:** 1 node failure
+    **Quorum:** 2 of 3 nodes
+    **Availability:** ✅ With 2 nodes
+  </Card>
+  
+  <Card title="5-Node Cluster" icon="server">
+    **Tolerates:** 2 node failures
+    **Quorum:** 3 of 5 nodes
+    **Availability:** ✅ With 3 nodes
+  </Card>
+  
+  <Card title="7-Node Cluster" icon="server">
+    **Tolerates:** 3 node failures
+    **Quorum:** 4 of 7 nodes
+    **Availability:** ✅ With 4 nodes
+  </Card>
+</CardGroup>
+
+**General formula:**
+- **Quorum size:** `⌊N/2⌋ + 1`
+- **Tolerated failures:** `⌊N/2⌋`
+
+<Warning>
+A 2-node cluster CANNOT tolerate any failures. Always deploy at least 3 nodes for production.
+</Warning>
+
+## Single Node Failure
+
+The most common failure scenario: one node crashes or becomes network-partitioned.
+
+### Scenario: Follower Node Fails
+
+**Initial state:**
+- Node 1: Raft leader, leads `logs:1`
+- Node 2: Follower, leads `logs:2`
+- Node 3: Follower, leads `logs:3`
+
+**Node 2 crashes:**
+
+```
+T=0s:     Node 2 crashes (network cable unplugged, process killed, etc.)
+
+T=0-5s:   Node 1 (Raft leader) stops receiving heartbeat ACKs from Node 2
+          - Raft still has quorum (2 of 3: Node 1 + Node 3)
+          - Cluster continues operating normally
+          - Writes to logs:1 and logs:3 succeed
+          - Writes to logs:2 FAIL (Node 2 is down)
+
+T=5s:     Client attempts PUT to logs:2
+          → Routes to Node 2 (metadata shows Node 2 leads logs:2)
+          → Connection refused / timeout
+          → Client retries on Node 1 or Node 3
+          → Forward to Node 2 fails
+          → Returns ERR "could not reach leader"
+
+T=10s:    Node 1's monitor loop runs
+          - Detects Node 2 is unreachable (Raft membership still includes it)
+          - Does NOT trigger automatic rollover (Node 2 still in voters)
+          - Segment logs:2 remains assigned to Node 2
+
+T=manual: Operator removes Node 2 from cluster (if outage is permanent)
+          → Raft membership change
+          → Next rollover will redistribute load across Node 1 and Node 3
+```
+
+<Accordion title="Why doesn't automatic rollover happen?">
+The system doesn't automatically reassign segments from failed nodes because:
+
+1. **Raft membership is the source of truth**: Until the node is removed from Raft voters, it's still considered part of the cluster
+2. **Prevents premature reassignment**: If Node 2 comes back in 30 seconds, we avoid unnecessary data movement
+3. **Operator control**: Forces explicit decision about whether the failure is temporary or permanent
+
+For automatic failover, use external monitoring (e.g., Kubernetes) to detect prolonged outages and remove the node from the cluster.
+</Accordion>
+
+**Impact:**
+- **Reads to sealed segments on Node 2**: FAIL (data is unavailable)
+- **Writes to active segment on Node 2**: FAIL (leader is down)
+- **Reads/writes to segments on Node 1 and Node 3**: SUCCEED (unaffected)
+- **Metadata operations**: SUCCEED (quorum is maintained)
+
+**Recovery:**
+
+<Steps>
+  <Step title="Short Outage (Node 2 restarts)">
+    Node 2 comes back online, syncs Raft log from leader, resumes serving logs:2.
+    
+    ```bash
+    # Node 2 logs:
+    Raft follower: syncing log from leader
+    Lease sync: granted logs:2
+    Client listener ready on :9092
+    ```
+    
+    **Downtime:** 0-5 minutes (depending on restart time)
+  </Step>
+  
+  <Step title="Prolonged Outage (Node 2 is gone)">
+    Operator explicitly removes Node 2 from the cluster.
+    
+    ```bash
+    # Connect to Node 1 or Node 3
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091
+    
+    # Check current membership
+    > METRICS
+    # Look for "voters": [1, 2, 3]
+    ```
+    
+    **Remove node** (requires Raft API access - not exposed via client protocol yet):
+    
+    ```rust
+    // Programmatically via Octopii API:
+    raft.remove_voter(2).await?;
+    ```
+    
+    **Effect:**
+    - Membership becomes [1, 3]
+    - Quorum is now 2 of 2 (both must be alive)
+    - Future rollovers rotate between Node 1 and Node 3
+    - Sealed segments on Node 2 remain inaccessible (data loss)
+  </Step>
+</Steps>
+
+### Scenario: Leader Node Fails
+
+**Initial state:**
+- Node 1: Raft leader
+- Node 2: Follower
+- Node 3: Follower
+
+**Node 1 crashes:**
+
+```
+T=0s:     Node 1 (Raft leader) crashes
+
+T=0-1s:   Node 2 and Node 3 detect missing heartbeats
+
+T=1-3s:   Election timeout fires on Node 2 and Node 3
+          - Both transition to Candidate state
+          - Both request votes from each other
+          - First to receive vote becomes new leader (e.g., Node 2)
+
+T=3s:     Node 2 becomes new Raft leader
+          - Sends heartbeats to Node 3
+          - Node 3 acknowledges, becomes Follower
+          - Cluster has new leader, quorum restored
+
+T=3s+:    System resumes normal operation
+          - Metadata operations route to Node 2 (new Raft leader)
+          - Segment leaders unchanged (logs:1 still assigned to Node 1)
+          - Writes to logs:1 FAIL (Node 1 is down)
+          - Writes to logs:2 and logs:3 SUCCEED
+```
+
+<Info>
+**Leader election time:** Typically 1-5 seconds depending on election timeout configuration and network latency.
+</Info>
+
+**Impact:**
+- **Metadata operations**: Briefly unavailable (1-5 seconds) during election, then resume
+- **Writes to Node 1's segments**: FAIL until Node 1 recovers or segments are reassigned
+- **Writes to Node 2 and Node 3's segments**: SUCCEED after election completes
+
+**Recovery:**
+
+Node 1 restarts and rejoins as a follower:
+
+```bash
+# Node 1 logs:
+Raft follower: current leader is Node 2
+Syncing metadata state machine
+Lease sync: granted logs:1 (if still assigned)
+Ready
+```
+
+## Multiple Node Failures
+
+### Two Nodes Fail (3-Node Cluster)
+
+**Scenario:**
+- Nodes 2 and 3 crash simultaneously
+- Only Node 1 remains
+
+**Result:**
+
+```
+❌ CLUSTER UNAVAILABLE
+
+Quorum: 2 of 3 required
+Available: 1 node (Node 1)
+Status: Cannot achieve quorum
+
+- No Raft leader can be elected
+- No metadata operations (REGISTER, rollovers)
+- No writes accepted (requires metadata to determine leader)
+- No reads succeed (require Raft RPC for forwarding)
+```
+
+**Recovery:**
+
+<Tabs>
+  <Tab title="Restart Failed Nodes">
+    Bring Node 2 or Node 3 back online to restore quorum.
+    
+    ```bash
+    # On Node 2:
+    docker start walrus-2
+    
+    # Or manually:
+    ./distributed-walrus --node-id 2 --join 192.168.1.10:6001 ...
+    ```
+    
+    **Effect:**
+    - Quorum restored (2 of 3)
+    - Raft elects new leader
+    - Cluster resumes operation
+    - Data on Node 1 is preserved
+  </Tab>
+  
+  <Tab title="Force Single-Node Mode (Data Loss Risk)">
+    <Warning>
+    **DANGEROUS:** Only use if Nodes 2 and 3 are permanently lost and you accept potential data loss.
+    </Warning>
+    
+    Rebuild cluster from Node 1's data:
+    
+    ```bash
+    # Stop Node 1
+    # Delete Raft metadata (keeps data, resets membership)
+    rm -rf data/node_1/raft_meta/*
+    
+    # Restart as new bootstrap leader
+    ./distributed-walrus --node-id 1 --raft-port 6001 ...
+    # (no --join flag)
+    ```
+    
+    **Effect:**
+    - Node 1 bootstraps new cluster
+    - Metadata reset (topics may need recreation)
+    - Data in `user_data/` preserved
+    - Nodes 2 and 3 cannot rejoin (stale metadata)
+  </Tab>
+</Tabs>
+
+### Network Partition (Split Brain Prevention)
+
+**Scenario:** Network partition splits cluster into two groups.
+
+```
+Before partition:
+[Node 1] ←→ [Node 2] ←→ [Node 3]
+
+After partition:
+[Node 1] ←→ [Node 2]   |   [Node 3]
+     Partition A        |   Partition B
+     (2 nodes)          |   (1 node)
+```
+
+**Behavior:**
+
+| Partition | Nodes | Quorum | Status |
+|-----------|-------|--------|--------|
+| A | Node 1, Node 2 | ✅ 2 of 3 | Operational |
+| B | Node 3 | ❌ 1 of 3 | Unavailable |
+
+**Partition A (majority):**
+- Elects a leader (Node 1 or Node 2)
+- Continues accepting reads/writes
+- Can commit metadata changes
+
+**Partition B (minority):**
+- Cannot elect a leader (no quorum)
+- Rejects all writes
+- Cannot serve reads that require forwarding
+
+<Check>
+**Split-brain protection:** Only one partition can operate (the majority). Prevents conflicting writes.
+</Check>
+
+**Recovery:**
+
+Network partition heals:
+
+```
+T=0:      Partition heals, all nodes can communicate again
+
+T=1s:     Node 3 receives heartbeat from leader in Partition A
+          - Realizes it's behind
+          - Syncs Raft log from leader
+          - Updates metadata state machine
+
+T=2s:     Node 3 fully caught up
+          - Resumes serving requests
+          - Normal operation restored
+```
+
+**Data consistency:**
+- Partition B did NOT accept writes (no quorum)
+- Partition A's writes are authoritative
+- No conflict resolution needed
+
+## Data Loss Scenarios
+
+### Sealed Segment on Failed Node
+
+**Problem:**
+- Segment `logs:1` sealed on Node 2 (1,000,000 entries)
+- Node 2's disk fails (data unrecoverable)
+- Reads for entries 0-999,999 fail
+
+**Current limitation:**
+- Distributed Walrus does NOT replicate sealed segment data across nodes
+- Each sealed segment exists only on its original leader
+- If that node's disk fails, the data is lost
+
+**Mitigation strategies:**
+
+<Tabs>
+  <Tab title="External Backups">
+    Periodically snapshot `user_data/` directory:
+    
+    ```bash
+    # Cron job on each node
+    0 */6 * * * tar -czf /backups/node_1_$(date +\%Y\%m\%d_\%H\%M).tar.gz /data/node_1/user_data
+    ```
+    
+    Restore from backup after node recovery.
+  </Tab>
+  
+  <Tab title="Disk RAID">
+    Use RAID 1/5/6 for data directories to tolerate disk failures.
+    
+    ```yaml
+    # docker-compose.yml
+    volumes:
+      - /mnt/raid/walrus/node1:/data
+    ```
+  </Tab>
+  
+  <Tab title="Object Storage Archival">
+    Stream sealed segments to S3/GCS:
+    
+    ```python
+    # Post-rollover hook (future feature)
+    def on_segment_sealed(topic, segment, path):
+        s3.upload_file(
+            path,
+            bucket='walrus-archive',
+            key=f'{topic}/{segment}.wal'
+        )
+    ```
+  </Tab>
+  
+  <Tab title="Replication (Future)">
+    Planned feature: replicate sealed segments to N nodes.
+    
+    ```
+    Segment logs:1 sealed → Replicate to Node 2 and Node 3
+    Node 2 fails → Reads still succeed from Node 3
+    ```
+    
+    **Status:** Not implemented. Track issue [#42](https://github.com/yourrepo/issues/42).
+  </Tab>
+</Tabs>
+
+### Active Segment on Failed Node
+
+**Problem:**
+- Segment `logs:5` active on Node 1 (500,000 entries written)
+- Node 1 crashes before segment is sealed
+- In-progress writes may be lost
+
+**What's preserved:**
+- Walrus WAL is durable (fsynced to disk)
+- Entries written before crash are recoverable
+- Raft metadata correctly reflects sealed segments
+
+**What's lost:**
+- Entries in OS page cache not yet fsynced (typically &lt;100ms worth)
+- In-flight writes that received `OK` but crashed before fsync
+
+**Recovery:**
+
+Node 1 restarts:
+
+```bash
+# Node 1 logs:
+Loading Walrus WAL files
+  logs:5.wal -> 499,950 entries recovered
+Syncing Raft metadata
+Lease sync: granted logs:5
+Ready
+
+# Client resumes writing:
+PUT logs data → Node 1 → Appends as entry 499,951
+```
+
+**Entry count discrepancy:**
+- Node 1's offset tracker: Reset to 0 (in-memory state lost)
+- Actual WAL entries: 499,950 (recovered from disk)
+- Monitor loop recounts: Queries Walrus `get_topic_size()`
+
+<Info>
+The system safely handles restarts. Offset tracking is best-effort for rollover triggers; actual entry counts come from Walrus at recovery time.
+</Info>
+
+## Operational Procedures
+
+### Graceful Node Shutdown
+
+To minimize disruption:
+
+<Steps>
+  <Step title="Stop Accepting New Connections">
+    ```bash
+    # On the node to be shut down:
+    # Close client port (stop accepting new connections)
+    iptables -A INPUT -p tcp --dport 9091 -j DROP
+    ```
+  </Step>
+  
+  <Step title="Drain In-Flight Requests">
+    Wait 5-10 seconds for active requests to complete.
+  </Step>
+  
+  <Step title="Trigger Rollover (If Leader)">
+    If the node leads any active segments, wait for or manually trigger rollover:
+    
+    ```bash
+    # Option 1: Wait for automatic rollover (next monitor tick)
+    sleep 30
+    
+    # Option 2: Write dummy entries to exceed threshold
+    for i in {1..1000000}; do
+      walrus-cli put logs "dummy"
+    done
+    ```
+  </Step>
+  
+  <Step title="Shutdown Node">
+    ```bash
+    # Docker:
+    docker stop walrus-1
+    
+    # Manual:
+    pkill -SIGTERM distributed-walrus
+    ```
+  </Step>
+</Steps>
+
+### Planned Node Replacement
+
+Replace Node 2 with a new Node 4:
+
+<Steps>
+  <Step title="Add Node 4">
+    ```bash
+    ./distributed-walrus --node-id 4 --join 192.168.1.10:6001 ...
+    ```
+    
+    Wait for Node 4 to catch up and be promoted to voter.
+  </Step>
+  
+  <Step title="Remove Node 2">
+    ```rust
+    // Via Raft API:
+    raft.remove_voter(2).await?;
+    ```
+    
+    **Effect:**
+    - Membership: [1, 3, 4]
+    - Quorum: 2 of 3
+  </Step>
+  
+  <Step title="Shutdown Node 2">
+    ```bash
+    docker stop walrus-2
+    rm -rf data/node_2/*
+    ```
+  </Step>
+</Steps>
+
+**Note:** Sealed segments on Node 2 become unavailable. Restore from backups if needed.
+
+### Disaster Recovery
+
+**Scenario:** All nodes crash simultaneously (data center power loss, etc.).
+
+<Tabs>
+  <Tab title="All Disks Intact">
+    Restart all nodes in any order:
+    
+    ```bash
+    # On each node (order doesn't matter):
+    ./distributed-walrus --node-id 1 --raft-port 6001 ...
+    ./distributed-walrus --node-id 2 --raft-port 6002 --join 192.168.1.10:6001 ...
+    ./distributed-walrus --node-id 3 --raft-port 6003 --join 192.168.1.10:6001 ...
+    ```
+    
+    **Recovery:**
+    - Raft metadata loaded from disk
+    - State machine restored
+    - Cluster resumes from last committed state
+    - No data loss (Walrus WAL is durable)
+  </Tab>
+  
+  <Tab title="Partial Disk Failure">
+    If Node 2's disk is unrecoverable:
+    
+    ```bash
+    # Restart Node 1 and Node 3 (quorum restored)
+    ./distributed-walrus --node-id 1 ...
+    ./distributed-walrus --node-id 3 --join ...
+    
+    # Add new Node 4 to replace Node 2
+    ./distributed-walrus --node-id 4 --join ...
+    
+    # Remove failed Node 2
+    raft.remove_voter(2).await?;
+    ```
+    
+    **Data loss:**
+    - Sealed segments on Node 2 are lost
+    - Restore from backups if available
+  </Tab>
+  
+  <Tab title="All Disks Lost">
+    <Warning>
+    **TOTAL DATA LOSS** - Rebuild from application-level backups or streams.
+    </Warning>
+    
+    ```bash
+    # Start fresh cluster
+    rm -rf data/*
+    make cluster-up
+    
+    # Reingest data from upstream sources
+    ```
+  </Tab>
+</Tabs>
+
+## Monitoring and Alerts
+
+Set up alerts for these conditions:
+
+### Raft Health Checks
+
+```bash
+# Query metrics from each node
+curl -s http://node1:9091/metrics | jq '.current_leader'
+curl -s http://node2:9092/metrics | jq '.current_leader'
+curl -s http://node3:9093/metrics | jq '.current_leader'
+```
+
+**Alert conditions:**
+- `current_leader == null` for >10 seconds → No leader elected
+- `current_leader` differs across nodes → Split brain or stale state
+- `state == "Candidate"` for >30 seconds → Election failing
+
+### Node Availability
+
+```bash
+# TCP port check
+nc -zv node1 9091 || echo "Node 1 client port down"
+nc -zv node1 6001 || echo "Node 1 Raft port down"
+```
+
+**Alert conditions:**
+- Client port unreachable → Node down
+- Raft port unreachable → Node partitioned
+
+### Segment Leader Distribution
+
+```bash
+walrus-cli state logs | jq '.segment_leaders'
+```
+
+```json
+{
+  "1": 1,
+  "2": 1,
+  "3": 1,
+  "4": 2,
+  "5": 3
+}
+```
+
+**Alert conditions:**
+- Skewed distribution (e.g., Node 1 leads 80% of segments) → Load imbalance
+- Leader for active segment is down → Writes failing
+
+### Disk Usage
+
+```bash
+du -sh /data/node_*/user_data
+```
+
+**Alert conditions:**
+- Disk >80% full → Risk of write failures
+- One node significantly larger → Uneven segment distribution
+
+## Testing Failure Scenarios
+
+Use the test suite to validate recovery:
+
+```bash
+# Resilience test: kills Node 2 mid-write, verifies recovery
+make cluster-test-resilience
+
+# Recovery test: stops all nodes, verifies restart
+make cluster-test-recovery
+```
+
+**Manual failure injection:**
+
+```bash
+# Kill a follower
+docker kill walrus-2
+sleep 5
+docker start walrus-2
+
+# Kill the leader
+docker kill walrus-1
+sleep 5
+docker start walrus-1
+
+# Network partition (iptables)
+iptables -A INPUT -s 192.168.1.11 -j DROP
+iptables -A OUTPUT -d 192.168.1.11 -j DROP
+# ... test ...
+iptables -F
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Deploy in Multiple Availability Zones">
+    Distribute nodes across AZs to tolerate zone failures:
+    
+    ```
+    Node 1: us-east-1a
+    Node 2: us-east-1b
+    Node 3: us-east-1c
+    ```
+    
+    Trade-off: Higher Raft latency (cross-AZ network), but better availability.
+  </Accordion>
+  
+  <Accordion title="Automate Node Replacement">
+    Use orchestration (Kubernetes, Nomad) to automatically replace failed nodes:
+    
+    ```yaml
+    # Kubernetes StatefulSet
+    spec:
+      replicas: 3
+      podManagementPolicy: Parallel
+      updateStrategy:
+        type: RollingUpdate
+    ```
+  </Accordion>
+  
+  <Accordion title="Monitor Raft Lag">
+    Track `last_log_index` vs `last_applied` on followers:
+    
+    ```bash
+    lag=$(( last_log_index - last_applied ))
+    if [ $lag -gt 1000 ]; then
+      echo "Follower falling behind"
+    fi
+    ```
+    
+    High lag indicates network issues or slow disk.
+  </Accordion>
+  
+  <Accordion title="Set Up Log Aggregation">
+    Centralize logs from all nodes:
+    
+    ```yaml
+    # docker-compose.yml
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: logs.example.com:24224
+    ```
+    
+    Makes diagnosing failures across nodes easier.
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Deployment Guide" icon="rocket" href="/cluster/deployment">
+    Review deployment best practices
+  </Card>
+  
+  <Card title="Segment Management" icon="layer-group" href="/cluster/segment-management">
+    Understand rollover and leadership
+  </Card>
+</CardGroup>

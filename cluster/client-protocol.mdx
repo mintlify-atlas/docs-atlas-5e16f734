@@ -1,0 +1,625 @@
+---
+title: 'Client Protocol'
+description: 'TCP protocol format, wire encoding, and available commands for interacting with the cluster'
+---
+
+## Protocol Overview
+
+Distributed Walrus exposes a simple, length-prefixed text protocol over TCP. Clients can connect to any node in the cluster, and the system handles routing automatically.
+
+### Design Principles
+
+- **Text-based**: Commands are UTF-8 strings (human-readable, easy to debug)
+- **Length-prefixed**: Fixed 4-byte header prevents message ambiguity
+- **Stateless**: Each command is independent (except read cursors are server-side)
+- **Synchronous**: Request-response model, one command at a time per connection
+
+<Info>
+The protocol is inspired by Redis RESP but simplified for streaming log workloads.
+</Info>
+
+## Wire Format
+
+### Request Format
+
+All requests follow this structure:
+
+```
+┌─────────────────┬──────────────────────────────┐
+│  Length (4B)    │  UTF-8 Command Text          │
+│  Little-Endian  │  (variable length)           │
+└─────────────────┴──────────────────────────────┘
+```
+
+**Example:** `PUT logs hello`
+
+```
+Bytes:  0x0E 0x00 0x00 0x00  P  U  T     l  o  g  s     h  e  l  l  o
+        └────────┬─────────┘  └────────────────┬──────────────────────┘
+           Length = 14              "PUT logs hello" (14 bytes)
+```
+
+### Response Format
+
+Responses use the same length-prefixed format:
+
+```
+┌─────────────────┬──────────────────────────────┐
+│  Length (4B)    │  UTF-8 Response Text         │
+│  Little-Endian  │  (variable length)           │
+└─────────────────┴──────────────────────────────┘
+```
+
+**Success responses:**
+- `OK` - Command succeeded
+- `OK <payload>` - Command succeeded with data
+- `EMPTY` - No data available (for GET)
+
+**Error responses:**
+- `ERR <message>` - Command failed with error message
+
+## Command Reference
+
+### REGISTER
+
+Create a topic if it doesn't already exist. Idempotent.
+
+**Syntax:**
+```
+REGISTER <topic>
+```
+
+**Parameters:**
+- `topic`: Topic name (alphanumeric, no spaces)
+
+**Response:**
+- `OK` - Topic created or already exists
+- `ERR <message>` - Failed to create topic
+
+**Example:**
+
+<CodeGroup>
+
+```bash CLI
+$ walrus-cli register logs
+OK
+```
+
+```rust Rust Client
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+async fn register_topic(stream: &mut TcpStream, topic: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let command = format!("REGISTER {}", topic);
+    let len = (command.len() as u32).to_le_bytes();
+    
+    stream.write_all(&len).await?;
+    stream.write_all(command.as_bytes()).await?;
+    
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let response_len = u32::from_le_bytes(len_buf) as usize;
+    
+    let mut response = vec![0u8; response_len];
+    stream.read_exact(&mut response).await?;
+    
+    println!("Response: {}", String::from_utf8_lossy(&response));
+    Ok(())
+}
+```
+
+```python Python Client
+import struct
+import socket
+
+def register_topic(sock, topic):
+    command = f"REGISTER {topic}".encode('utf-8')
+    length = struct.pack('<I', len(command))
+    
+    sock.sendall(length + command)
+    
+    resp_len = struct.unpack('<I', sock.recv(4))[0]
+    response = sock.recv(resp_len).decode('utf-8')
+    
+    print(f"Response: {response}")
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.connect(('127.0.0.1', 9091))
+register_topic(sock, 'logs')
+```
+
+</CodeGroup>
+
+**Under the hood:**
+1. Node checks if topic exists in metadata
+2. If missing, proposes `CreateTopic` via Raft consensus
+3. Initial leader is selected via consistent hashing
+4. Metadata is replicated across all nodes
+
+---
+
+### PUT
+
+Append data to a topic. Automatically routes to the current segment leader.
+
+**Syntax:**
+```
+PUT <topic> <payload>
+```
+
+**Parameters:**
+- `topic`: Topic name
+- `payload`: Data to append (rest of command after topic, can contain spaces)
+
+**Response:**
+- `OK` - Data appended successfully
+- `ERR unknown topic` - Topic doesn't exist (use REGISTER first)
+- `ERR NotLeaderForPartition` - Temporary leadership transfer error (retry)
+
+**Example:**
+
+<CodeGroup>
+
+```bash CLI
+$ walrus-cli put logs "User login: alice@example.com"
+OK
+
+$ walrus-cli put logs "{\"event\":\"purchase\",\"amount\":99.99}"
+OK
+```
+
+```bash Raw TCP (netcat)
+$ echo -ne '\x0f\x00\x00\x00PUT logs hello' | nc localhost 9091 | xxd
+00000000: 0200 0000 4f4b                           ....OK
+```
+
+</CodeGroup>
+
+**Flow:**
+1. Client sends PUT to any node (e.g., Node 2)
+2. Node 2 checks metadata: which node leads this topic's current segment?
+3. If Node 2 is leader: write directly to local Walrus
+4. If Node 1 is leader: forward via internal RPC to Node 1
+5. Leader checks write lease and appends to Walrus
+6. Leader tracks entry count for rollover detection
+7. Response flows back to client
+
+<Warning>
+Large payloads (>64KB) will be rejected. For bulk ingestion, send multiple smaller PUTs or consider batching at the application layer.
+</Warning>
+
+---
+
+### GET
+
+Read the next entry from a topic using a shared server-side cursor. The cursor automatically advances across sealed segments.
+
+**Syntax:**
+```
+GET <topic>
+```
+
+**Parameters:**
+- `topic`: Topic name
+
+**Response:**
+- `OK <data>` - Entry data (cursor advances)
+- `EMPTY` - No data available yet (cursor doesn't advance)
+- `ERR unknown topic` - Topic doesn't exist
+
+**Example:**
+
+<CodeGroup>
+
+```bash CLI
+# First read
+$ walrus-cli get logs
+OK hello world
+
+# Second read
+$ walrus-cli get logs
+OK another message
+
+# No more data
+$ walrus-cli get logs
+EMPTY
+```
+
+```python Python Consumer
+def consume_forever(sock, topic):
+    while True:
+        command = f"GET {topic}".encode('utf-8')
+        length = struct.pack('<I', len(command))
+        sock.sendall(length + command)
+        
+        resp_len = struct.unpack('<I', sock.recv(4))[0]
+        response = sock.recv(resp_len).decode('utf-8')
+        
+        if response == "EMPTY":
+            time.sleep(0.1)  # No data, backoff
+            continue
+        
+        if response.startswith("OK "):
+            data = response[3:]  # Strip "OK "
+            print(f"Got: {data}")
+```
+
+</CodeGroup>
+
+**Cursor behavior:**
+
+The server maintains a shared cursor per topic:
+
+```rust
+struct ReadCursor {
+    segment: u64,              // Current segment (1, 2, 3, ...)
+    delivered_in_segment: u64, // Entries delivered from this segment
+}
+```
+
+**Cursor advancement rules:**
+
+1. **Within segment**: Increment `delivered_in_segment` on each successful read
+2. **Sealed segment exhausted**: If `delivered_in_segment >= sealed_count`, move to next segment
+3. **Active segment empty**: Return `EMPTY` (wait for more data)
+
+**Example cursor progression:**
+
+```
+Initial state:        {segment: 1, delivered: 0}
+After 1st GET:        {segment: 1, delivered: 1}
+After 1,000,000 GETs: {segment: 1, delivered: 1,000,000}
+(Segment 1 sealed at 1M entries)
+Next GET:             {segment: 2, delivered: 0}
+```
+
+<Note>
+The cursor is shared across all client connections. Multiple consumers reading from the same topic will receive different entries (round-robin style).
+</Note>
+
+---
+
+### STATE
+
+Retrieve metadata for a topic, including segment layout and leadership.
+
+**Syntax:**
+```
+STATE <topic>
+```
+
+**Parameters:**
+- `topic`: Topic name
+
+**Response:**
+- JSON object with topic state
+- `ERR unknown topic` - Topic doesn't exist
+
+**Example:**
+
+```bash
+$ walrus-cli state logs
+```
+
+```json
+{
+  "current_segment": 3,
+  "leader_node": 2,
+  "last_sealed_entry_offset": 1950000,
+  "sealed_segments": {
+    "1": 1000000,
+    "2": 950000
+  },
+  "segment_leaders": {
+    "1": 3,
+    "2": 1,
+    "3": 2
+  }
+}
+```
+
+**Field descriptions:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `current_segment` | `u64` | Active segment accepting writes |
+| `leader_node` | `u64` | Node ID currently leading the active segment |
+| `last_sealed_entry_offset` | `u64` | Cumulative entries across all sealed segments |
+| `sealed_segments` | `map<u64, u64>` | Segment ID → entry count for sealed segments |
+| `segment_leaders` | `map<u64, u64>` | Segment ID → node ID (historical leaders) |
+
+**Use cases:**
+- Monitor segment distribution across nodes
+- Debug routing issues
+- Calculate total entries: `last_sealed_entry_offset + (entries in current segment)`
+- Understand leadership history
+
+---
+
+### METRICS
+
+Retrieve Raft cluster metrics and health information.
+
+**Syntax:**
+```
+METRICS
+```
+
+**Response:**
+- JSON object with Raft metrics
+
+**Example:**
+
+```bash
+$ walrus-cli metrics
+```
+
+```json
+{
+  "id": 1,
+  "current_term": 5,
+  "current_leader": 1,
+  "state": "Leader",
+  "last_log_index": 1234,
+  "last_applied": 1234,
+  "membership_config": {
+    "voters": [1, 2, 3],
+    "learners": []
+  }
+}
+```
+
+**Key metrics:**
+
+| Metric | Description |
+|--------|-------------|
+| `current_leader` | Node ID of Raft leader (or null if no leader) |
+| `state` | Node's Raft role: `Leader`, `Follower`, `Candidate` |
+| `last_log_index` | Latest Raft log entry index |
+| `last_applied` | Last index applied to state machine |
+| `voters` | List of voting node IDs |
+
+<Check>
+A healthy cluster should show:
+- `current_leader` is non-null
+- `last_applied` closely trails `last_log_index`
+- `voters` includes all expected nodes
+</Check>
+
+## Connection Management
+
+### Persistent Connections
+
+Clients can reuse the same TCP connection for multiple commands:
+
+```python
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.connect(('127.0.0.1', 9091))
+
+# Send multiple commands over same connection
+send_command(sock, "REGISTER logs")
+send_command(sock, "PUT logs message1")
+send_command(sock, "PUT logs message2")
+send_command(sock, "GET logs")
+
+sock.close()
+```
+
+**Benefits:**
+- Avoid TCP handshake overhead
+- Lower latency for burst operations
+- Connection pooling friendly
+
+### Timeouts and Retries
+
+<Tabs>
+  <Tab title="Network Errors">
+    **Connection refused**: Node is down or port not open
+    - Retry with a different node (e.g., 9092, 9093)
+    
+    **Connection reset**: Node crashed mid-request
+    - Reconnect and retry command (PUTs are NOT idempotent)
+  </Tab>
+  
+  <Tab title="Application Errors">
+    **`ERR NotLeaderForPartition`**: Lease is transferring
+    - Wait 100-200ms and retry
+    
+    **`ERR no raft leader known`**: Cluster is re-electing
+    - Wait and retry (usually resolves in &lt;5 seconds)
+    
+    **`ERR unknown topic`**: Topic doesn't exist
+    - Send REGISTER first, then retry
+  </Tab>
+</Tabs>
+
+### Load Balancing
+
+For high availability, use a load balancer to distribute client connections:
+
+```
+┌──────────┐
+│  Clients │
+└────┬─────┘
+     │
+┌────▼──────────┐
+│ Load Balancer │
+│   (HAProxy)   │
+└───┬──┬───┬────┘
+    │  │   │
+┌───▼──▼───▼────┐
+│ Node 1  Node 2│
+│    Node 3     │
+└───────────────┘
+```
+
+**HAProxy config example:**
+
+```haproxy
+listen walrus-cluster
+    bind *:9090
+    mode tcp
+    balance roundrobin
+    server node1 192.168.1.10:9091 check
+    server node2 192.168.1.11:9092 check
+    server node3 192.168.1.12:9093 check
+```
+
+Clients connect to `:9090`, and HAProxy distributes to `:9091-9093`.
+
+## Client Libraries
+
+### Official CLI
+
+The Rust CLI client is the reference implementation:
+
+```bash
+# Interactive REPL
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091
+
+# One-off commands
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 put logs "data"
+```
+
+**Source:** `distributed-walrus/src/bin/walrus-cli.rs` (see [GitHub](https://github.com/nubskr/walrus/tree/main/distributed-walrus/src/bin))
+
+### Third-Party Clients
+
+Community clients (contribution welcome!):
+
+- **Python**: `pip install walrus-client` (planned)
+- **Go**: `github.com/user/walrus-go` (planned)
+- **Node.js**: `npm install walrus-js` (planned)
+
+### Writing a Custom Client
+
+Minimal client in 50 lines:
+
+<CodeGroup>
+
+```python Python
+import struct
+import socket
+
+class WalrusClient:
+    def __init__(self, host='127.0.0.1', port=9091):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.connect((host, port))
+    
+    def _send(self, command):
+        data = command.encode('utf-8')
+        length = struct.pack('<I', len(data))
+        self.sock.sendall(length + data)
+        
+        resp_len = struct.unpack('<I', self.sock.recv(4))[0]
+        response = self.sock.recv(resp_len).decode('utf-8')
+        return response
+    
+    def register(self, topic):
+        return self._send(f"REGISTER {topic}")
+    
+    def put(self, topic, data):
+        return self._send(f"PUT {topic} {data}")
+    
+    def get(self, topic):
+        resp = self._send(f"GET {topic}")
+        if resp == "EMPTY":
+            return None
+        return resp[3:]  # Strip "OK "
+    
+    def close(self):
+        self.sock.close()
+
+# Usage
+client = WalrusClient()
+client.register("events")
+client.put("events", "user_signup")
+print(client.get("events"))  # "user_signup"
+client.close()
+```
+
+```go Go
+package main
+
+import (
+    "encoding/binary"
+    "fmt"
+    "net"
+)
+
+type WalrusClient struct {
+    conn net.Conn
+}
+
+func NewClient(addr string) (*WalrusClient, error) {
+    conn, err := net.Dial("tcp", addr)
+    if err != nil {
+        return nil, err
+    }
+    return &WalrusClient{conn: conn}, nil
+}
+
+func (c *WalrusClient) send(command string) (string, error) {
+    data := []byte(command)
+    length := make([]byte, 4)
+    binary.LittleEndian.PutUint32(length, uint32(len(data)))
+    
+    _, err := c.conn.Write(append(length, data...))
+    if err != nil {
+        return "", err
+    }
+    
+    respLen := make([]byte, 4)
+    _, err = c.conn.Read(respLen)
+    if err != nil {
+        return "", err
+    }
+    
+    response := make([]byte, binary.LittleEndian.Uint32(respLen))
+    _, err = c.conn.Read(response)
+    return string(response), err
+}
+
+func (c *WalrusClient) Put(topic, data string) error {
+    resp, err := c.send(fmt.Sprintf("PUT %s %s", topic, data))
+    if err != nil {
+        return err
+    }
+    if resp != "OK" {
+        return fmt.Errorf("put failed: %s", resp)
+    }
+    return nil
+}
+```
+
+</CodeGroup>
+
+## Protocol Limitations
+
+<Warning>
+**Current limitations (may be addressed in future versions):**
+
+- **No authentication**: All connections are trusted
+- **No TLS**: Data sent in plaintext
+- **No batching**: One command per request
+- **No streaming**: Must poll with GET for new data
+- **Single cursor**: No consumer groups or parallel consumers per topic
+- **No explicit offsets**: Cannot seek to arbitrary position
+</Warning>
+
+For production deployments, consider:
+- Running in a private network with firewall rules
+- Using a VPN or SSH tunnel for encryption
+- Implementing authentication at the load balancer layer
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Segment Management" icon="layer-group" href="/cluster/segment-management">
+    Learn how segments roll over and leases work
+  </Card>
+  
+  <Card title="Failure Recovery" icon="life-ring" href="/cluster/failure-recovery">
+    Handle errors and node failures
+  </Card>
+</CardGroup>

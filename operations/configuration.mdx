@@ -1,0 +1,265 @@
+---
+title: Configuration
+description: Configure Walrus distributed log streaming engine with CLI flags and environment variables
+---
+
+Walrus provides flexible configuration through command-line flags and environment variables. This guide covers all available configuration options for both distributed and standalone deployments.
+
+## Distributed Walrus Configuration
+
+### CLI Flags
+
+When running a distributed Walrus node, use these command-line flags to configure the cluster:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--node-id` | (required) | Unique node identifier (integer) |
+| `--data-dir` | `./data` | Root directory for storage |
+| `--raft-port` | `6000` | Raft/Internal RPC port |
+| `--raft-host` | `127.0.0.1` | Raft bind address |
+| `--raft-advertise-host` | (raft-host) | Advertised Raft address for peer discovery |
+| `--client-port` | `8080` | Client TCP port |
+| `--client-host` | `127.0.0.1` | Client bind address |
+| `--join` | - | Address of existing node to join (e.g., `127.0.0.1:6001`) |
+| `--initial-peer` | - | List of initial peer addresses for bootstrapping leader |
+| `--log-file` | - | Optional file path for log output (defaults to stdout) |
+
+### Starting a 3-Node Cluster
+
+<CodeGroup>
+```bash Node 1 (Bootstrap Leader)
+cargo run -- \
+  --node-id 1 \
+  --raft-port 6001 \
+  --client-port 9091 \
+  --raft-host 127.0.0.1 \
+  --client-host 127.0.0.1
+```
+
+```bash Node 2 (Join Cluster)
+cargo run -- \
+  --node-id 2 \
+  --raft-port 6002 \
+  --client-port 9092 \
+  --join 127.0.0.1:6001
+```
+
+```bash Node 3 (Join Cluster)
+cargo run -- \
+  --node-id 3 \
+  --raft-port 6003 \
+  --client-port 9093 \
+  --join 127.0.0.1:6001
+```
+</CodeGroup>
+
+<Note>
+The first node (`node-id 1`) without a `--join` flag automatically becomes the bootstrap leader. All subsequent nodes must use `--join` to connect to an existing cluster member.
+</Note>
+
+### Docker Deployment
+
+When running Walrus in Docker containers, bind to `0.0.0.0` and use advertised addresses:
+
+```bash Docker Example
+docker run -p 9091:9091 -p 6001:6001 walrus \
+  --node-id 1 \
+  --raft-host 0.0.0.0 \
+  --raft-advertise-host walrus-1.example.com \
+  --client-host 0.0.0.0 \
+  --data-dir /data
+```
+
+## Environment Variables
+
+Configure runtime behavior with these environment variables:
+
+### Segment Configuration
+
+<ParamField path="WALRUS_MAX_SEGMENT_ENTRIES" type="integer" default="1000000">
+  Number of entries before automatic segment rollover. Higher values reduce rollover frequency but increase segment size.
+  
+  ```bash
+  export WALRUS_MAX_SEGMENT_ENTRIES=2000000
+  ```
+</ParamField>
+
+<ParamField path="WALRUS_MONITOR_CHECK_MS" type="integer" default="10000">
+  Monitor loop interval in milliseconds. Controls how frequently the system checks for segment rollover conditions.
+  
+  ```bash
+  export WALRUS_MONITOR_CHECK_MS=5000  # Check every 5 seconds
+  ```
+</ParamField>
+
+### Storage Backend Configuration
+
+<ParamField path="WALRUS_DISABLE_IO_URING" type="boolean" default="false">
+  Disable io_uring backend on Linux and use mmap instead. Set to any value to disable io_uring.
+  
+  ```bash
+  export WALRUS_DISABLE_IO_URING=1
+  ```
+</ParamField>
+
+<Warning>
+Disabling io_uring will reduce throughput for batch operations on Linux. Only disable if you encounter compatibility issues.
+</Warning>
+
+<ParamField path="WALRUS_DATA_DIR" type="string" default="wal_files">
+  Base directory for WAL storage files (standalone library usage).
+  
+  ```bash
+  export WALRUS_DATA_DIR=/var/lib/walrus/data
+  ```
+</ParamField>
+
+<ParamField path="WALRUS_INSTANCE_KEY" type="string">
+  Namespace isolation key for standalone library usage. Creates a subdirectory under `WALRUS_DATA_DIR`.
+  
+  ```bash
+  export WALRUS_INSTANCE_KEY=tenant-123
+  ```
+</ParamField>
+
+### Logging Configuration
+
+<ParamField path="RUST_LOG" type="string" default="info">
+  Log level for the application. Valid values: `trace`, `debug`, `info`, `warn`, `error`.
+  
+  ```bash
+  export RUST_LOG=debug
+  export RUST_LOG=walrus=debug,info  # Module-specific logging
+  ```
+</ParamField>
+
+<ParamField path="WALRUS_QUIET" type="boolean">
+  Suppress debug output from the storage layer. Set to any value to enable quiet mode.
+  
+  ```bash
+  export WALRUS_QUIET=1
+  ```
+</ParamField>
+
+## Storage Engine Configuration
+
+When using Walrus as a standalone library, configure these parameters via the API:
+
+### Consistency Models
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+// Strict consistency - every read checkpoint is persisted immediately
+let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce)?;
+
+// At-least-once delivery - persist every N reads (higher throughput)
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 }
+)?;
+```
+
+### Fsync Scheduling
+
+```rust
+use walrus_rust::{Walrus, FsyncSchedule};
+
+// Fsync every 500ms (default is 200ms)
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::Milliseconds(500)
+)?;
+
+// Fsync after every single write (maximum durability)
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::SyncEach
+)?;
+
+// Never fsync (maximum throughput, no durability)
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::NoFsync
+)?;
+```
+
+## Storage Layout
+
+Walrus organizes data in the following directory structure:
+
+```
+data/
+├── node_1/
+│   ├── user_data/          # Walrus storage engine files
+│   │   └── data_plane/     # Namespace for user data
+│   │       ├── 1234567890  # Timestamp-based WAL files (1GB each)
+│   │       └── 1234567891
+│   └── raft_meta/          # Raft metadata storage
+│       ├── raft.db
+│       └── snapshots/
+├── node_2/
+│   └── ...
+└── node_3/
+    └── ...
+```
+
+### File Characteristics
+
+- **WAL Files**: Pre-allocated to 1GB (100 × 10MB blocks)
+- **Naming**: Millisecond timestamp (monotonically increasing)
+- **Block Size**: 10MB logical segments
+- **Entry Format**: 64-byte metadata prefix + payload + FNV-1a checksum
+
+## Configuration Best Practices
+
+<AccordionGroup>
+  <Accordion title="Production Deployment">
+    - Use at least 3 nodes for fault tolerance
+    - Set `WALRUS_MAX_SEGMENT_ENTRIES` based on your write rate and rollover frequency needs
+    - Keep default `WALRUS_MONITOR_CHECK_MS` (10s) unless you need faster rollover detection
+    - Use `--log-file` for persistent logging in production
+    - Mount `--data-dir` on a fast SSD with adequate space
+  </Accordion>
+
+  <Accordion title="High-Throughput Workloads">
+    - Ensure io_uring is enabled (default on Linux)
+    - Use `FsyncSchedule::Milliseconds(500)` or higher for write-heavy workloads
+    - Consider `ReadConsistency::AtLeastOnce` with `persist_every: 10000` for maximum read throughput
+    - Increase `WALRUS_MAX_SEGMENT_ENTRIES` to reduce rollover overhead
+  </Accordion>
+
+  <Accordion title="Development and Testing">
+    - Single node is sufficient for local development
+    - Use `RUST_LOG=debug` for detailed logs
+    - Smaller `WALRUS_MAX_SEGMENT_ENTRIES` (e.g., 10000) for faster rollover testing
+    - Set `WALRUS_MONITOR_CHECK_MS=1000` for rapid rollover during tests
+  </Accordion>
+</AccordionGroup>
+
+## Configuration Validation
+
+On startup, Walrus validates configuration and logs warnings for potential issues:
+
+```bash
+# Example startup output
+INFO  Node 1 booting
+INFO  Registered node address 127.0.0.1:6001
+INFO  Monitor loop started
+INFO  Client listener bound to 127.0.0.1:9091
+INFO  Lease update loop started
+```
+
+<Check>
+If all components start successfully, your configuration is valid. Check logs for any `ERROR` or `WARN` messages.
+</Check>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+    Learn how to monitor cluster health and metrics
+  </Card>
+  <Card title="Performance Tuning" icon="gauge-high" href="/operations/performance-tuning">
+    Optimize Walrus for your workload
+  </Card>
+</CardGroup>

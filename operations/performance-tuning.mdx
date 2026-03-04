@@ -1,0 +1,559 @@
+---
+title: Performance Tuning
+description: Optimize Walrus for high-throughput streaming workloads with io_uring, batch operations, and configuration tuning
+---
+
+Walrus is designed for high-performance streaming workloads. This guide covers optimization strategies, performance characteristics, and tuning parameters to maximize throughput and minimize latency.
+
+## Performance Overview
+
+### Benchmark Results
+
+Walrus delivers exceptional performance compared to similar systems:
+
+#### Without Fsync (Maximum Throughput)
+
+| System   | Avg Throughput (writes/s) | Avg Bandwidth (MB/s) | Max Throughput (writes/s) | Max Bandwidth (MB/s) |
+|----------|----------------------------|------------------------|-----------------------------|--------------------------|
+| **Walrus**   | **1,205,762**          | **876.22**            | **1,593,984**               | **1,158.62**            |
+| Kafka    | 1,112,120                  | 808.33                | 1,424,073                   | 1,035.74                |
+| RocksDB  | 432,821                    | 314.53                | 1,000,000                   | 726.53                  |
+
+#### With Fsync (Durability Enabled)
+
+| System   | Avg Throughput (writes/s) | Avg Bandwidth (MB/s) | Max Throughput (writes/s) | Max Bandwidth (MB/s) |
+|----------|----------------------------|------------------------|-----------------------------|--------------------------|
+| RocksDB  | 5,222                      | 3.79                  | 10,486                      | 7.63                    |
+| **Walrus**   | **4,980**              | **3.60**              | **11,389**                  | **8.19**                |
+| Kafka    | 4,921                      | 3.57                  | 11,224                      | 8.34                    |
+
+<Info>
+Benchmarks compare single Kafka broker (no replication) and RocksDB's WAL against Walrus using `pwrite()` syscalls. With io_uring batching enabled, Walrus can achieve significantly higher throughput.
+</Info>
+
+## io_uring: The Performance Multiplier
+
+The most significant performance optimization in Walrus is io_uring support on Linux. io_uring provides:
+
+- **Batched I/O submission**: Submit multiple operations in a single syscall
+- **Kernel-level parallelism**: Concurrent disk operations
+- **Reduced context switches**: Fewer transitions between user and kernel space
+- **Zero-copy operations**: Direct memory access for reads/writes
+
+### Enabling io_uring
+
+io_uring is **enabled by default** on Linux when using the FD (file descriptor) backend:
+
+```rust
+use walrus_rust::Walrus;
+
+// io_uring is automatically used for batch operations on Linux
+let wal = Walrus::new()?;
+
+// Batch write - uses io_uring on Linux
+let batch = vec![b"msg1".as_slice(), b"msg2".as_slice()];
+wal.batch_append_for_topic("events", &batch)?;
+```
+
+### Disabling io_uring (Not Recommended)
+
+Only disable io_uring if you encounter compatibility issues:
+
+```bash
+# Environment variable
+export WALRUS_DISABLE_IO_URING=1
+
+# Or in code
+use walrus_rust::disable_fd_backend;
+disable_fd_backend();
+```
+
+<Warning>
+Disabling io_uring can reduce batch operation throughput by **3-10x**. Only disable for debugging or compatibility reasons.
+</Warning>
+
+### io_uring Requirements
+
+- **OS**: Linux kernel 5.1+ (5.6+ recommended)
+- **Libraries**: `liburing` installed
+- **Architecture**: x86_64, ARM64, or other supported platforms
+
+Check io_uring availability:
+
+```bash
+# Check kernel version
+uname -r
+# Should be >= 5.1.0
+
+# Check if liburing is available
+ldconfig -p | grep liburing
+```
+
+## Batch Operations
+
+Batch operations are the key to high throughput. They allow Walrus to amortize overhead across multiple entries.
+
+### Batch Writes
+
+<CodeGroup>
+```rust Batch Write Example
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+
+// Atomic batch write (all-or-nothing)
+let batch: Vec<&[u8]> = vec![
+    b"entry 1",
+    b"entry 2",
+    b"entry 3",
+    // ... up to 2,000 entries
+];
+
+wal.batch_append_for_topic("events", &batch)?;
+```
+
+```rust Single Write (Less Efficient)
+// Don't do this in a loop - use batch instead!
+for i in 0..1000 {
+    wal.append_for_topic("events", format!("entry {}", i).as_bytes())?;
+}
+```
+</CodeGroup>
+
+**Performance impact**:
+- **Batch write**: 1 io_uring submission for 1,000 entries
+- **Single writes**: 1,000 separate syscalls
+- **Speedup**: 3-10x depending on entry size
+
+### Batch Reads
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+
+// Read up to 1MB of data in one call
+let max_bytes = 1024 * 1024;
+let entries = wal.batch_read_for_topic("events", max_bytes, true)?;
+
+// Process entries
+for entry in entries {
+    println!("Read {} bytes", entry.data.len());
+}
+```
+
+**Best practices**:
+- Set `max_bytes` based on your processing buffer size
+- At least 1 entry is always returned if available
+- Maximum 2,000 entries per call (configurable limit)
+
+### Batch Size Limits
+
+<ParamField path="MAX_BATCH_ENTRIES" type="integer" default="2000">
+  Maximum entries per batch operation (read or write).
+  
+  **Why 2,000?** The default io_uring submission queue size is 2,047 entries. Staying below this ensures all operations fit in a single submission.
+</ParamField>
+
+<ParamField path="MAX_BATCH_BYTES" type="integer" default="10GB">
+  Maximum total payload size per batch write.
+  
+  **Why 10GB?** Large enough for most use cases while keeping memory usage bounded during planning phase.
+</ParamField>
+
+## Segment Size Tuning
+
+Segment size affects rollover frequency and load distribution across nodes.
+
+### Default Configuration
+
+```bash
+export WALRUS_MAX_SEGMENT_ENTRIES=1000000  # 1 million entries
+```
+
+With 1KB average entry size:
+- Segment size: ~1GB
+- Rollover time at 10k writes/sec: ~100 seconds
+- Leadership rotates every segment
+
+### Tuning Guidelines
+
+<AccordionGroup>
+  <Accordion title="High Write Rate (>100k writes/sec)">
+    **Increase segment size** to reduce rollover overhead:
+    
+    ```bash
+    export WALRUS_MAX_SEGMENT_ENTRIES=5000000  # 5 million entries
+    ```
+    
+    **Benefits**:
+    - Fewer Raft consensus operations
+    - Less frequent leadership rotation
+    - Reduced metadata updates
+    
+    **Tradeoffs**:
+    - Longer time to distribute load to new nodes
+    - Larger disk space per segment
+  </Accordion>
+
+  <Accordion title="Dynamic Load Balancing">
+    **Decrease segment size** for faster load distribution:
+    
+    ```bash
+    export WALRUS_MAX_SEGMENT_ENTRIES=500000  # 500k entries
+    ```
+    
+    **Benefits**:
+    - More frequent leadership rotation
+    - Faster load distribution across nodes
+    - Quicker adaptation to cluster changes
+    
+    **Tradeoffs**:
+    - More rollover overhead
+    - More frequent Raft consensus operations
+  </Accordion>
+
+  <Accordion title="Large Entry Sizes (>10KB per entry)">
+    **Decrease segment entries** to maintain reasonable segment sizes:
+    
+    ```bash
+    # With 100KB average entry size
+    export WALRUS_MAX_SEGMENT_ENTRIES=100000  # Still ~10GB per segment
+    ```
+    
+    **Rule of thumb**: Target 1-10GB per segment regardless of entry count.
+  </Accordion>
+</AccordionGroup>
+
+### Monitor Interval Tuning
+
+```bash
+export WALRUS_MONITOR_CHECK_MS=10000  # Check every 10 seconds (default)
+```
+
+<Tip>
+**Faster rollover detection** (lower values):
+- Reduce for development/testing: `WALRUS_MONITOR_CHECK_MS=1000`
+- Keep default (10s) for production - frequent checks add overhead
+
+**Slower rollover detection** (higher values):
+- Increase if rollover overhead is noticeable: `WALRUS_MONITOR_CHECK_MS=30000`
+- Don't set too high - delays load balancing
+</Tip>
+
+## Fsync Scheduling
+
+Fsync scheduling controls the durability vs. throughput tradeoff.
+
+### Strategies
+
+<Tabs>
+  <Tab title="High Throughput (Default)">
+    ```rust
+    use walrus_rust::{Walrus, FsyncSchedule};
+    
+    // Fsync every 200ms (default)
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::Milliseconds(200)
+    )?;
+    ```
+    
+    **Characteristics**:
+    - Batches fsyncs across multiple writes
+    - Good balance of durability and throughput
+    - **Risk**: Up to 200ms of data loss on crash
+  </Tab>
+
+  <Tab title="Maximum Throughput">
+    ```rust
+    // Never fsync - maximum throughput
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync
+    )?;
+    ```
+    
+    **Characteristics**:
+    - 3-10x higher throughput vs. fsync-per-write
+    - OS will eventually flush to disk
+    - **Risk**: Potential data loss on crash/power failure
+    
+    <Warning>
+    Only use `NoFsync` for:
+    - Development/testing
+    - Ephemeral data
+    - When replication provides durability
+    </Warning>
+  </Tab>
+
+  <Tab title="Maximum Durability">
+    ```rust
+    // Fsync after every write
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::SyncEach
+    )?;
+    ```
+    
+    **Characteristics**:
+    - Every write is durable before acknowledging
+    - Uses `O_SYNC` flag on file descriptors
+    - **Impact**: 100-200x lower throughput
+    
+    <Info>
+    Use `SyncEach` only when:
+    - Absolute durability is required
+    - Write rate is low (&lt;1000 writes/sec)
+    - Regulatory compliance requires it
+    </Info>
+  </Tab>
+
+  <Tab title="Balanced (Recommended)">
+    ```rust
+    // Fsync every 500ms - good balance
+    let wal = Walrus::with_consistency_and_schedule(
+        ReadConsistency::AtLeastOnce { persist_every: 1000 },
+        FsyncSchedule::Milliseconds(500)
+    )?;
+    ```
+    
+    **Characteristics**:
+    - Reasonable durability (500ms window)
+    - High throughput for most workloads
+    - AtLeastOnce reduces read checkpoint overhead
+  </Tab>
+</Tabs>
+
+## Read Consistency Tuning
+
+Read consistency affects how often read cursors are persisted.
+
+### StrictlyAtOnce (Default)
+
+```rust
+let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce)?;
+```
+
+**Behavior**:
+- Every read checkpoint is immediately persisted
+- Guarantees exactly-once delivery after restart
+- Higher durability, moderate read throughput
+
+**Use when**: Duplicate processing is unacceptable
+
+### AtLeastOnce (Higher Throughput)
+
+```rust
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 }
+)?;
+```
+
+**Behavior**:
+- Persist cursor every N reads
+- After restart, may replay up to N entries
+- Lower durability, higher read throughput
+
+**Use when**: Duplicate processing is acceptable, throughput is critical
+
+### Tuning persist_every
+
+```rust
+// Low latency, low replay risk
+ReadConsistency::AtLeastOnce { persist_every: 100 }
+
+// High throughput, accept more replay
+ReadConsistency::AtLeastOnce { persist_every: 10000 }
+
+// Maximum throughput, large replay window
+ReadConsistency::AtLeastOnce { persist_every: 100000 }
+```
+
+<Tip>
+Balance based on your processing cost:
+- **Expensive processing**: Lower `persist_every` (100-1000)
+- **Cheap processing**: Higher `persist_every` (10000+)
+- **Idempotent processing**: Maximum `persist_every`
+</Tip>
+
+## Storage Backend Selection
+
+### FD Backend (Default, Recommended)
+
+```rust
+use walrus_rust::enable_fd_backend;
+
+enable_fd_backend(); // Default, explicit call not needed
+```
+
+**Advantages**:
+- io_uring support on Linux
+- Better batch operation performance
+- O_SYNC support for `SyncEach` mode
+
+**Disadvantages**:
+- Unix-only (not available on Windows)
+
+### Mmap Backend
+
+```rust
+use walrus_rust::disable_fd_backend;
+
+disable_fd_backend(); // Switch to mmap
+```
+
+**Advantages**:
+- Cross-platform (works on Windows)
+- Direct memory access for reads
+- No file descriptor limits
+
+**Disadvantages**:
+- No io_uring support
+- Lower batch operation performance
+- More complex memory management
+
+## Distributed Cluster Tuning
+
+### Lease Synchronization
+
+The lease synchronization loop runs every 100ms by default. This is hardcoded but provides good balance:
+
+- **100ms**: Fast enough for quick leader transitions
+- **100ms**: Low enough overhead (0.1% CPU per node)
+
+<Note>
+If you need faster leader transitions, you'll need to modify the source code in `controller/mod.rs`. However, values below 50ms may increase CPU usage noticeably.
+</Note>
+
+### Raft Configuration
+
+While most Raft parameters are configured through Octopii (the Raft implementation), key tuning points:
+
+<ParamField path="heartbeat_interval" type="duration" default="150ms">
+  How often the leader sends heartbeats to followers.
+  
+  **Tuning**: Lower values detect failures faster but increase network traffic.
+</ParamField>
+
+<ParamField path="election_timeout" type="duration" default="300-600ms">
+  Time before a follower starts an election.
+  
+  **Tuning**: Higher values reduce false elections, lower values speed up failure recovery.
+</ParamField>
+
+## System-Level Optimizations
+
+### Linux I/O Scheduler
+
+```bash
+# Check current scheduler
+cat /sys/block/sda/queue/scheduler
+
+# Set to none (for NVMe) or mq-deadline (for SSD)
+echo none > /sys/block/sda/queue/scheduler
+```
+
+Recommended schedulers:
+- **NVMe drives**: `none` (direct I/O)
+- **SSD**: `mq-deadline` or `bfq`
+- **HDD**: `deadline` (not recommended for Walrus)
+
+### File System Tuning
+
+```bash
+# Mount with noatime for better performance
+mount -o remount,noatime,nodiratime /data
+
+# XFS is recommended for large files
+mkfs.xfs -f /dev/sdb
+mount -o noatime,nodiratime /dev/sdb /data
+```
+
+**Recommended file systems**:
+1. **XFS** - Best for large sequential writes
+2. **ext4** - Good all-around performance
+3. **ZFS** - Advanced features, higher overhead
+
+### CPU Governor
+
+```bash
+# Set CPU to performance mode
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+```
+
+## Performance Profiling
+
+### Measuring Throughput
+
+```rust
+use std::time::Instant;
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+let batch: Vec<&[u8]> = vec![b"test"; 1000];
+
+let start = Instant::now();
+for _ in 0..100 {
+    wal.batch_append_for_topic("bench", &batch)?;
+}
+let elapsed = start.elapsed();
+
+let total_entries = 100 * 1000;
+let throughput = total_entries as f64 / elapsed.as_secs_f64();
+println!("Throughput: {:.0} entries/sec", throughput);
+```
+
+### Profiling with perf
+
+```bash
+# Record performance data
+sudo perf record -g cargo run --release --bin your-app
+
+# Analyze results
+sudo perf report
+```
+
+Look for hotspots in:
+- `io_uring` submission/completion
+- Memory allocation
+- Serialization/deserialization
+
+## Performance Checklist
+
+<Steps>
+  <Step title="Enable io_uring">
+    Ensure Linux kernel >= 5.6 and FD backend enabled
+  </Step>
+  
+  <Step title="Use batch operations">
+    Replace single writes with batches (up to 2,000 entries)
+  </Step>
+  
+  <Step title="Tune fsync schedule">
+    Set to 200-500ms for most workloads, NoFsync for testing
+  </Step>
+  
+  <Step title="Choose consistency model">
+    Use AtLeastOnce with high persist_every for maximum throughput
+  </Step>
+  
+  <Step title="Adjust segment size">
+    Balance between rollover frequency and load distribution needs
+  </Step>
+  
+  <Step title="Optimize system">
+    Configure I/O scheduler, file system, and CPU governor
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+    Monitor performance metrics in production
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/operations/troubleshooting">
+    Diagnose performance issues
+  </Card>
+</CardGroup>

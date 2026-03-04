@@ -1,0 +1,218 @@
+---
+title: 'Library Overview'
+description: 'Use Walrus as an embedded Rust library for high-performance write-ahead logging'
+---
+
+## What is Walrus as a Library?
+
+Walrus can be embedded directly into your Rust application as a high-performance Write-Ahead Log (WAL) library. This gives you complete control over data persistence, consistency guarantees, and storage configuration without running a separate distributed cluster.
+
+## When to Use Library Mode
+
+Use Walrus as a library when:
+
+- **Single Process**: Your application runs in a single process and doesn't need distributed coordination
+- **Embedded Storage**: You need a reliable, fast WAL for state management, event sourcing, or data pipelines
+- **Custom Control**: You want fine-grained control over consistency models, fsync schedules, and storage backends
+- **Low Latency**: You need sub-millisecond write and read operations without network overhead
+
+## When to Use Distributed Mode
+
+Consider distributed Walrus when:
+
+- **Multiple Processes**: Your workload spans multiple machines or processes
+- **High Availability**: You need replication and failover capabilities
+- **Horizontal Scaling**: Your throughput requirements exceed a single machine
+- **Remote Access**: Clients need network access to the log
+
+## Key Features
+
+### High Performance
+
+- Optimized for concurrent reads and writes
+- Block-based storage with 10MB blocks (1GB files)
+- Support for io_uring on Linux for parallel I/O (FD backend)
+- Minimal allocation overhead
+
+### Topic-Based Organization
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+
+// Each topic maintains independent read/write streams
+wal.append_for_topic("orders", b"order-123")?;
+wal.append_for_topic("payments", b"payment-456")?;
+wal.append_for_topic("inventory", b"item-789")?;
+```
+
+Topics provide logical separation within a single WAL instance. Each topic has:
+- Independent read cursors
+- Separate write streams
+- Isolated checkpoint positions
+
+### Configurable Consistency
+
+Choose the right trade-off between durability and performance:
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+// Strictly-at-once: every checkpoint persisted immediately
+let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce)?;
+
+// At-least-once: checkpoint every N reads for higher throughput
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 }
+)?;
+```
+
+See [Configuration](/library/configuration) for detailed consistency model explanations.
+
+### Dual Storage Backends
+
+Walrus supports two storage implementations:
+
+**FD Backend (Default)**
+- Uses file descriptors with `pread`/`pwrite` syscalls
+- Batch operations use io_uring on Linux for parallel I/O
+- Supports O_SYNC mode for synchronous writes
+- Best for: Linux systems, batch-heavy workloads
+
+**Mmap Backend**
+- Memory-mapped file I/O
+- Sequential batch operations (no io_uring)
+- Cross-platform compatibility
+- Best for: Non-Linux platforms, Windows
+
+See [Storage Backends](/library/storage-backends) for backend selection and performance characteristics.
+
+### Persistent Read Offsets
+
+Read positions automatically survive process restarts:
+
+```rust
+{
+    let wal = Walrus::new()?;
+    wal.append_for_topic("events", b"event-1")?;
+    wal.append_for_topic("events", b"event-2")?;
+    
+    // Checkpoint=true persists the read position
+    let entry = wal.read_next("events", true)?.unwrap();
+    assert_eq!(entry.data, b"event-1");
+} // WAL dropped, process could restart here
+
+{
+    let wal = Walrus::new()?;
+    // Resumes from persisted position
+    let entry = wal.read_next("events", true)?.unwrap();
+    assert_eq!(entry.data, b"event-2");
+}
+```
+
+### Namespace Isolation
+
+Create isolated WAL instances with separate storage directories:
+
+```rust
+use walrus_rust::Walrus;
+
+// Each namespace has its own directory under wal_files/
+let tenant1 = Walrus::new_for_key("tenant-123")?;
+let tenant2 = Walrus::new_for_key("tenant-456")?;
+
+tenant1.append_for_topic("orders", b"data-1")?;
+tenant2.append_for_topic("orders", b"data-2")?;
+
+// Data is completely isolated between namespaces
+```
+
+Storage layout:
+```
+wal_files/
+├── tenant-123/
+│   ├── data files
+│   └── read_offset_idx.db
+└── tenant-456/
+    ├── data files
+    └── read_offset_idx.db
+```
+
+## Basic Usage
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+fn main() -> std::io::Result<()> {
+    // Create a WAL instance
+    let wal = Walrus::new()?;
+    
+    // Write data to topics
+    wal.append_for_topic("my-topic", b"Hello, Walrus!")?;
+    
+    // Read with checkpoint (consumes the entry)
+    if let Some(entry) = wal.read_next("my-topic", true)? {
+        println!("Data: {:?}", String::from_utf8_lossy(&entry.data));
+    }
+    
+    // Peek without consuming (checkpoint=false)
+    if let Some(entry) = wal.read_next("my-topic", false)? {
+        println!("Peeking: {:?}", String::from_utf8_lossy(&entry.data));
+    }
+    
+    Ok(())
+}
+```
+
+## Builder API (Recommended)
+
+When you need explicit control over the data directory, use the builder API to avoid race conditions with the `WALRUS_DATA_DIR` environment variable:
+
+```rust
+use walrus_rust::Walrus;
+use std::path::PathBuf;
+
+let wal = Walrus::builder()
+    .data_dir(PathBuf::from("/var/lib/myapp/wal"))
+    .key("tenant-123")
+    .build()?;
+```
+
+This is especially important in multi-threaded applications where different threads need different data directories.
+
+## Performance Characteristics
+
+- **Block size**: 10MB per block
+- **File size**: 100 blocks per file (1GB files)
+- **Batch limits**: Up to 2,000 entries or ~10GB payload per batch
+- **Default fsync interval**: 200ms
+- **Checksum algorithm**: FNV-1a 64-bit for data integrity
+
+## Environment Variables
+
+<ParamField path="WALRUS_DATA_DIR" type="string" default="./wal_files">
+  Storage directory for all WAL data
+</ParamField>
+
+<ParamField path="WALRUS_INSTANCE_KEY" type="string">
+  Default namespace key for all instances
+</ParamField>
+
+<ParamField path="WALRUS_QUIET" type="string">
+  Set to `1` to suppress debug output
+</ParamField>
+
+Example usage:
+```bash
+export WALRUS_DATA_DIR=/var/lib/myapp/wal
+export WALRUS_INSTANCE_KEY=production
+export WALRUS_QUIET=1
+```
+
+## Next Steps
+
+- [Basic Operations](/library/basic-operations) - Learn about `append_for_topic` and `read_next`
+- [Batch Operations](/library/batch-operations) - High-throughput batch APIs with io_uring
+- [Configuration](/library/configuration) - Consistency models and fsync schedules
+- [Storage Backends](/library/storage-backends) - FD vs mmap backend selection

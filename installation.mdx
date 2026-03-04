@@ -1,0 +1,594 @@
+---
+title: Installation
+description: Installation instructions for both standalone library and distributed cluster deployments
+---
+
+## Overview
+
+Walrus can be installed in two ways depending on your use case:
+
+<CardGroup cols={2}>
+  <Card title="Library Installation" icon="rust">
+    For embedding Walrus in your Rust application
+  </Card>
+  
+  <Card title="Cluster Deployment" icon="server">
+    For running a distributed fault-tolerant cluster
+  </Card>
+</CardGroup>
+
+## Library Installation
+
+### Prerequisites
+
+- Rust 2024 edition or later
+- Cargo package manager
+
+<Note>
+On Linux, Walrus automatically uses io_uring for high-performance batch operations. Other platforms fall back to sequential I/O.
+</Note>
+
+### Add to Your Project
+
+<Steps>
+  <Step title="Add Dependency">
+    Add Walrus to your `Cargo.toml`:
+    
+    ```toml Cargo.toml
+    [dependencies]
+    walrus-rust = "0.2.0"
+    ```
+  </Step>
+  
+  <Step title="Import and Use">
+    ```rust main.rs
+    use walrus_rust::Walrus;
+    
+    fn main() -> std::io::Result<()> {
+        let wal = Walrus::new()?;
+        
+        // Write data
+        wal.append_for_topic("my-topic", b"Hello, Walrus!")?;
+        
+        // Read data
+        if let Some(entry) = wal.read_next("my-topic", true)? {
+            println!("Read: {:?}", String::from_utf8_lossy(&entry.data));
+        }
+        
+        Ok(())
+    }
+    ```
+  </Step>
+  
+  <Step title="Build Your Project">
+    ```bash
+    cargo build --release
+    ```
+  </Step>
+</Steps>
+
+### Configuration Options
+
+#### Storage Backend
+
+Choose between FD (file descriptor) and mmap backends:
+
+```rust
+use walrus_rust::{Walrus, WalrusBuilder, StorageBackend};
+
+// FD backend (default) - uses pread/pwrite, io_uring on Linux
+let wal = WalrusBuilder::new()
+    .backend(StorageBackend::FD)
+    .build()?;
+
+// Mmap backend - memory-mapped I/O
+let wal = WalrusBuilder::new()
+    .backend(StorageBackend::Mmap)
+    .build()?;
+```
+
+#### Consistency Models
+
+Configure read consistency behavior:
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+// Strict: Every checkpoint persisted immediately (lower throughput)
+let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce)?;
+
+// At-least-once: Persist every N reads (higher throughput)
+// Allows replaying up to N entries after crash
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 }
+)?;
+```
+
+#### Fsync Scheduling
+
+Control when data is flushed to disk:
+
+```rust
+use walrus_rust::{Walrus, FsyncSchedule};
+
+// Sync each write (maximum durability, lower throughput)
+let wal = Walrus::with_fsync_schedule(FsyncSchedule::SyncEach)?;
+
+// No fsync (maximum throughput, data loss on crash)
+let wal = Walrus::with_fsync_schedule(FsyncSchedule::NoFsync)?;
+
+// Sync every N writes (balanced)
+let wal = Walrus::with_fsync_schedule(FsyncSchedule::SyncEvery(100))?;
+```
+
+#### Namespace Isolation
+
+Create isolated WAL instances with separate directories:
+
+```rust
+use walrus_rust::{Walrus, WalrusBuilder};
+
+// Create isolated instances for different components
+let metrics_wal = WalrusBuilder::new()
+    .for_key("metrics")
+    .build()?;
+
+let logs_wal = WalrusBuilder::new()
+    .for_key("application_logs")
+    .build()?;
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WAL_DIR` | `./wal_files` | Root directory for WAL files |
+| `WALRUS_DISABLE_IO_URING` | - | Disable io_uring on Linux |
+
+## Cluster Deployment
+
+Deploy a distributed cluster for fault-tolerant streaming with automatic load balancing.
+
+### Prerequisites
+
+<Tabs>
+  <Tab title="Docker Deployment">
+    - Docker 20.10+
+    - Docker Compose 2.0+
+    - Python 3.7+ (for test scripts)
+  </Tab>
+  
+  <Tab title="Manual Deployment">
+    - Rust 2024 edition or later
+    - Linux recommended (for io_uring support)
+    - 3+ machines for fault tolerance
+  </Tab>
+</Tabs>
+
+### Docker Deployment (Recommended)
+
+<Steps>
+  <Step title="Clone Repository">
+    ```bash
+    git clone https://github.com/nubskr/walrus.git
+    cd walrus/distributed-walrus
+    ```
+  </Step>
+  
+  <Step title="Bootstrap Cluster">
+    Start a 3-node cluster:
+    
+    ```bash
+    make cluster-bootstrap
+    ```
+    
+    This command:
+    - Builds the Docker image
+    - Starts 3 nodes on ports 9091-9093 (client) and 6001-6003 (Raft)
+    - Initializes Raft consensus
+    - Waits for cluster readiness
+  </Step>
+  
+  <Step title="Verify Cluster">
+    Check that all nodes are running:
+    
+    ```bash
+    docker ps
+    ```
+    
+    You should see 3 containers:
+    - `walrus-node-1`
+    - `walrus-node-2`
+    - `walrus-node-3`
+  </Step>
+  
+  <Step title="Test Connection">
+    ```bash
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091
+    ```
+    
+    In the CLI:
+    ```
+    🦭 > METRICS
+    ```
+    
+    You should see Raft state with 3 voters.
+  </Step>
+</Steps>
+
+### Docker Compose Configuration
+
+The default `docker-compose.yml` sets up a 3-node cluster:
+
+```yaml docker-compose.yml
+version: '3.8'
+
+services:
+  walrus-node-1:
+    build: .
+    container_name: walrus-node-1
+    ports:
+      - "9091:9091"  # Client port
+      - "6001:6001"  # Raft port
+    environment:
+      - NODE_ID=1
+      - RUST_LOG=info
+      - WALRUS_MAX_SEGMENT_ENTRIES=1000000
+    volumes:
+      - ./data/node1:/data
+
+  walrus-node-2:
+    build: .
+    container_name: walrus-node-2
+    ports:
+      - "9092:9092"
+      - "6002:6002"
+    environment:
+      - NODE_ID=2
+      - JOIN_ADDR=walrus-node-1:6001
+      - RUST_LOG=info
+    volumes:
+      - ./data/node2:/data
+
+  walrus-node-3:
+    build: .
+    container_name: walrus-node-3
+    ports:
+      - "9093:9093"
+      - "6003:6003"
+    environment:
+      - NODE_ID=3
+      - JOIN_ADDR=walrus-node-1:6001
+      - RUST_LOG=info
+    volumes:
+      - ./data/node3:/data
+```
+
+### Manual Deployment
+
+For production deployments without Docker:
+
+<Steps>
+  <Step title="Build Binary">
+    ```bash
+    cd walrus/distributed-walrus
+    cargo build --release
+    ```
+    
+    Binary will be at: `target/release/distributed-walrus`
+  </Step>
+  
+  <Step title="Start First Node (Bootstrap)">
+    On the first machine:
+    
+    ```bash
+    ./distributed-walrus \
+      --node-id 1 \
+      --data-dir /var/lib/walrus \
+      --raft-port 6001 \
+      --raft-host 0.0.0.0 \
+      --raft-advertise-host 10.0.1.10 \
+      --client-port 9091 \
+      --client-host 0.0.0.0
+    ```
+    
+    Replace `10.0.1.10` with the actual IP address.
+  </Step>
+  
+  <Step title="Start Additional Nodes">
+    On subsequent machines:
+    
+    ```bash
+    # Node 2
+    ./distributed-walrus \
+      --node-id 2 \
+      --data-dir /var/lib/walrus \
+      --raft-port 6002 \
+      --raft-host 0.0.0.0 \
+      --raft-advertise-host 10.0.1.11 \
+      --client-port 9092 \
+      --client-host 0.0.0.0 \
+      --join 10.0.1.10:6001
+    
+    # Node 3
+    ./distributed-walrus \
+      --node-id 3 \
+      --data-dir /var/lib/walrus \
+      --raft-port 6003 \
+      --raft-host 0.0.0.0 \
+      --raft-advertise-host 10.0.1.12 \
+      --client-port 9093 \
+      --client-host 0.0.0.0 \
+      --join 10.0.1.10:6001
+    ```
+  </Step>
+  
+  <Step title="Verify Cluster">
+    Connect to any node:
+    
+    ```bash
+    cargo run --bin walrus-cli -- --addr 10.0.1.10:9091
+    ```
+    
+    Check metrics:
+    ```
+    🦭 > METRICS
+    ```
+  </Step>
+</Steps>
+
+### CLI Flags Reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--node-id` | (required) | Unique node identifier (1, 2, 3, ...) |
+| `--data-dir` | `./data` | Root directory for storage |
+| `--raft-port` | `6000` | Raft/Internal RPC port |
+| `--raft-host` | `127.0.0.1` | Raft bind address |
+| `--raft-advertise-host` | (raft-host) | Advertised Raft address |
+| `--client-port` | `8080` | Client TCP port |
+| `--client-host` | `127.0.0.1` | Client bind address |
+| `--join` | - | Address of existing node to join |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WALRUS_MAX_SEGMENT_ENTRIES` | `1000000` | Entries before segment rollover |
+| `WALRUS_MONITOR_CHECK_MS` | `10000` | Monitor loop interval (ms) |
+| `WALRUS_DISABLE_IO_URING` | - | Use mmap instead of io_uring |
+| `RUST_LOG` | `info` | Log level (debug, info, warn, error) |
+
+## Installing the CLI
+
+The CLI can be installed separately for client use:
+
+<Steps>
+  <Step title="Build CLI">
+    ```bash
+    cd walrus/distributed-walrus
+    cargo build --release --bin walrus-cli
+    ```
+  </Step>
+  
+  <Step title="Install Globally (Optional)">
+    ```bash
+    cargo install --path . --bin walrus-cli
+    ```
+    
+    Now you can use `walrus-cli` from anywhere.
+  </Step>
+  
+  <Step title="Use CLI">
+    ```bash
+    walrus-cli --addr 127.0.0.1:9091
+    ```
+  </Step>
+</Steps>
+
+## Systemd Service (Production)
+
+For production deployments, run nodes as systemd services:
+
+<Steps>
+  <Step title="Create Service File">
+    Create `/etc/systemd/system/walrus-node.service`:
+    
+    ```ini
+    [Unit]
+    Description=Walrus Distributed Node
+    After=network.target
+    
+    [Service]
+    Type=simple
+    User=walrus
+    Group=walrus
+    WorkingDirectory=/opt/walrus
+    ExecStart=/opt/walrus/bin/distributed-walrus \
+      --node-id 1 \
+      --data-dir /var/lib/walrus \
+      --raft-port 6001 \
+      --raft-host 0.0.0.0 \
+      --raft-advertise-host 10.0.1.10 \
+      --client-port 9091 \
+      --client-host 0.0.0.0
+    Restart=always
+    RestartSec=10
+    Environment="RUST_LOG=info"
+    Environment="WALRUS_MAX_SEGMENT_ENTRIES=1000000"
+    
+    [Install]
+    WantedBy=multi-user.target
+    ```
+  </Step>
+  
+  <Step title="Enable and Start">
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl enable walrus-node
+    sudo systemctl start walrus-node
+    ```
+  </Step>
+  
+  <Step title="Check Status">
+    ```bash
+    sudo systemctl status walrus-node
+    sudo journalctl -u walrus-node -f
+    ```
+  </Step>
+</Steps>
+
+## Cluster Management Commands
+
+Common management tasks:
+
+<CodeGroup>
+```bash Start Cluster
+make cluster-up
+```
+
+```bash Stop Cluster
+make cluster-down
+```
+
+```bash View Logs
+make cluster-logs
+```
+
+```bash Restart Cluster
+make cluster-restart
+```
+
+```bash Clean Data
+make cluster-clean
+```
+</CodeGroup>
+
+## Monitoring
+
+### Health Checks
+
+Check node health via CLI:
+
+```bash
+# Connect to node
+walrus-cli --addr 127.0.0.1:9091
+
+# Check Raft metrics
+🦭 > METRICS
+```
+
+Look for:
+- `state: "Leader"` or `state: "Follower"`
+- `current_term` increasing over time
+- `last_applied` matching `last_log_index`
+
+### Logs
+
+Docker deployment:
+```bash
+docker logs walrus-node-1 -f
+```
+
+Manual deployment:
+```bash
+journalctl -u walrus-node -f
+```
+
+Enable debug logging:
+```bash
+export RUST_LOG=debug
+```
+
+## Upgrading
+
+<Warning>
+Always backup your data before upgrading.
+</Warning>
+
+<Steps>
+  <Step title="Backup Data">
+    ```bash
+    tar -czf walrus-backup-$(date +%Y%m%d).tar.gz ./data/
+    ```
+  </Step>
+  
+  <Step title="Stop Cluster">
+    ```bash
+    make cluster-down
+    ```
+  </Step>
+  
+  <Step title="Pull Latest Code">
+    ```bash
+    git pull origin main
+    ```
+  </Step>
+  
+  <Step title="Rebuild and Restart">
+    ```bash
+    make cluster-bootstrap
+    ```
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+### Port Already in Use
+
+If ports are occupied:
+
+```bash
+# Check what's using the port
+lsof -i :9091
+
+# Kill the process or change ports in docker-compose.yml
+```
+
+### Node Won't Join Cluster
+
+Check:
+- Network connectivity between nodes
+- Firewall rules allow Raft ports (6001-6003)
+- Correct `--join` address specified
+- Bootstrap node is running
+
+```bash
+# Test connectivity
+telnet 10.0.1.10 6001
+```
+
+### Data Corruption
+
+If data is corrupted:
+
+```bash
+# Stop node
+make cluster-down
+
+# Remove data (WARNING: data loss)
+rm -rf ./data/node1/*
+
+# Restart - node will rejoin and sync from other nodes
+make cluster-up
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get your first example running
+  </Card>
+  
+  <Card title="Configuration" icon="sliders" href="/operations/configuration">
+    Advanced configuration options
+  </Card>
+  
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the distributed architecture
+  </Card>
+  
+  <Card title="Operations" icon="gears" href="/operations/monitoring">
+    Production deployment best practices
+  </Card>
+</CardGroup>

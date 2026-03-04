@@ -1,80 +1,406 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get started with Walrus in minutes - both as a library and as a distributed cluster
 ---
 
-## Get started in three steps
+## Choose Your Mode
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
+Walrus can be used in two ways:
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Library Mode" icon="book">
+    Embed Walrus in your Rust application for local, high-performance WAL
+  </Card>
+  
+  <Card title="Cluster Mode" icon="server">
+    Deploy a distributed cluster for fault-tolerant streaming
+  </Card>
 </CardGroup>
 
+## Library Mode Quickstart
+
+Use Walrus as a standalone library for single-node, high-performance write-ahead logging.
+
+<Steps>
+  <Step title="Add Dependency">
+    Add Walrus to your `Cargo.toml`:
+    
+    ```toml Cargo.toml
+    [dependencies]
+    walrus-rust = "0.2.0"
+    ```
+  </Step>
+  
+  <Step title="Create a WAL Instance">
+    ```rust
+    use walrus_rust::Walrus;
+    
+    fn main() -> std::io::Result<()> {
+        // Create a new WAL instance
+        let wal = Walrus::new()?;
+        
+        Ok(())
+    }
+    ```
+  </Step>
+  
+  <Step title="Write Data">
+    Write messages to topics:
+    
+    ```rust
+    // Append to a topic
+    wal.append_for_topic("logs", b"Application started")?;
+    wal.append_for_topic("logs", b"User logged in")?;
+    wal.append_for_topic("metrics", b"CPU: 45%")?;
+    ```
+  </Step>
+  
+  <Step title="Read Data">
+    Read messages back from topics:
+    
+    ```rust
+    // Read with checkpoint (consumes the entry)
+    if let Some(entry) = wal.read_next("logs", true)? {
+        println!("Read: {:?}", String::from_utf8_lossy(&entry.data));
+        // Output: "Application started"
+    }
+    
+    // Read next entry
+    if let Some(entry) = wal.read_next("logs", true)? {
+        println!("Read: {:?}", String::from_utf8_lossy(&entry.data));
+        // Output: "User logged in"
+    }
+    ```
+  </Step>
+</Steps>
+
+### Batch Operations
+
+For higher throughput, use batch operations:
+
+```rust
+use walrus_rust::Walrus;
+
+fn main() -> std::io::Result<()> {
+    let wal = Walrus::new()?;
+    
+    // Atomic batch write (all-or-nothing)
+    let batch = vec![
+        b"entry 1".as_slice(),
+        b"entry 2".as_slice(),
+        b"entry 3".as_slice(),
+    ];
+    wal.batch_append_for_topic("events", &batch)?;
+    
+    // Batch read with byte limit
+    let max_bytes = 1024 * 1024; // 1MB
+    let entries = wal.batch_read_for_topic("events", max_bytes, true)?;
+    
+    for entry in entries {
+        println!("Read: {} bytes", entry.data.len());
+    }
+    
+    Ok(())
+}
+```
+
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+Batch operations on Linux automatically use io_uring for parallel I/O, delivering exceptional performance. Maximum 2,000 entries and ~10GB per batch.
 </Note>
+
+### Consistency Models
+
+Choose between different consistency models:
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+// Strict consistency - every checkpoint persisted immediately
+let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce)?;
+
+// At-least-once delivery - persist every N reads (higher throughput)
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 }
+)?;
+```
+
+## Cluster Mode Quickstart
+
+Deploy a fault-tolerant distributed cluster with automatic load balancing.
+
+<Steps>
+  <Step title="Clone the Repository">
+    ```bash
+    git clone https://github.com/nubskr/walrus.git
+    cd walrus/distributed-walrus
+    ```
+  </Step>
+  
+  <Step title="Bootstrap the Cluster">
+    Start a 3-node cluster using Docker Compose:
+    
+    ```bash
+    make cluster-bootstrap
+    ```
+    
+    This command:
+    - Builds the distributed Walrus image
+    - Starts 3 nodes (ports 9091-9093)
+    - Initializes Raft consensus
+    - Waits for all nodes to be ready
+  </Step>
+  
+  <Step title="Connect with CLI">
+    Launch the interactive CLI:
+    
+    ```bash
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091
+    ```
+    
+    You'll see the Walrus banner and prompt:
+    
+    ```
+    🦭 >
+    ```
+  </Step>
+  
+  <Step title="Create a Topic">
+    Register a new topic:
+    
+    ```
+    🦭 > REGISTER logs
+    OK
+    ```
+  </Step>
+  
+  <Step title="Write Messages">
+    Append messages to the topic:
+    
+    ```
+    🦭 > PUT logs "Application started"
+    OK
+    
+    🦭 > PUT logs "User authentication successful"
+    OK
+    
+    🦭 > PUT logs "Database connection established"
+    OK
+    ```
+  </Step>
+  
+  <Step title="Read Messages">
+    Consume messages from the topic:
+    
+    ```
+    🦭 > GET logs
+    OK Application started
+    
+    🦭 > GET logs
+    OK User authentication successful
+    
+    🦭 > GET logs
+    OK Database connection established
+    
+    🦭 > GET logs
+    EMPTY
+    ```
+  </Step>
+</Steps>
+
+### Inspect Cluster State
+
+Use the built-in commands to inspect the cluster:
+
+<CodeGroup>
+```bash Topic State
+🦭 > STATE logs
+{
+  "current_segment": 1,
+  "leader_node": 1,
+  "sealed_segments": {},
+  "segment_leaders": {
+    "1": 1
+  }
+}
+```
+
+```bash Cluster Metrics
+🦭 > METRICS
+{
+  "state": "Leader",
+  "current_term": 3,
+  "last_log_index": 45,
+  "last_applied": 45,
+  "current_leader": 1,
+  "membership_config": {
+    "voters": [1, 2, 3],
+    "learners": []
+  }
+}
+```
+</CodeGroup>
+
+## Client Protocol
+
+The cluster exposes a simple length-prefixed text protocol over TCP:
+
+### Wire Format
+
+```
+[4 bytes: length (little-endian)] [UTF-8 command]
+```
+
+### Commands
+
+| Command | Description | Response |
+|---------|-------------|----------|
+| `REGISTER <topic>` | Create topic if missing | `OK` |
+| `PUT <topic> <payload>` | Append to topic | `OK` |
+| `GET <topic>` | Read next entry (shared cursor) | `OK <data>` or `EMPTY` |
+| `STATE <topic>` | Get topic metadata | `OK <json>` |
+| `METRICS` | Get Raft metrics | `OK <json>` |
+
+### Responses
+
+- **Success**: `OK` or `OK <payload>`
+- **Empty read**: `EMPTY` (no data available)
+- **Error**: `ERR <message>`
+
+## Using the CLI (Non-Interactive)
+
+For scripting, use one-off commands:
+
+<CodeGroup>
+```bash Register Topic
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 register logs
+```
+
+```bash Write Data
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 put logs "hello world"
+```
+
+```bash Read Data
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 get logs
+```
+
+```bash Check State
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 state logs
+```
+</CodeGroup>
+
+## Testing Fault Tolerance
+
+<Steps>
+  <Step title="Write Some Data">
+    ```
+    🦭 > PUT logs "Before node failure"
+    OK
+    ```
+  </Step>
+  
+  <Step title="Stop a Node">
+    ```bash
+    docker compose -f docker-compose.yml stop walrus-node-2
+    ```
+  </Step>
+  
+  <Step title="Continue Writing">
+    The cluster automatically handles the failure:
+    
+    ```
+    🦭 > PUT logs "After node failure"
+    OK
+    ```
+    
+    Writes continue as long as you have quorum (2 of 3 nodes).
+  </Step>
+  
+  <Step title="Restart the Node">
+    ```bash
+    docker compose -f docker-compose.yml start walrus-node-2
+    ```
+    
+    The node rejoins and catches up automatically.
+  </Step>
+</Steps>
+
+<Warning>
+You need at least 2 of 3 nodes running to maintain quorum and accept writes. Losing quorum makes the cluster read-only until nodes recover.
+</Warning>
+
+## Observing Segment Rollover
+
+Watch automatic load balancing in action:
+
+```bash
+# Write enough data to trigger rollover (default: 1M entries)
+for i in {1..1000000}; do
+  echo "PUT logs \"Message $i\""
+done | cargo run --bin walrus-cli -- --addr 127.0.0.1:9091
+
+# Check the topic state
+🦭 > STATE logs
+{
+  "current_segment": 2,
+  "leader_node": 2,
+  "sealed_segments": {
+    "1": 1000000
+  },
+  "segment_leaders": {
+    "1": 1,
+    "2": 2
+  }
+}
+```
+
+Notice:
+- Segment 1 is sealed with 1M entries
+- Segment 2 is active with leadership transferred to node 2
+- Load is now distributed across nodes
+
+## Configuration
+
+Environment variables for cluster tuning:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WALRUS_MAX_SEGMENT_ENTRIES` | `1000000` | Entries before segment rollover |
+| `WALRUS_MONITOR_CHECK_MS` | `10000` | Monitor loop interval (ms) |
+| `WALRUS_DISABLE_IO_URING` | - | Use mmap instead of io_uring |
+| `RUST_LOG` | `info` | Log level (debug, info, warn) |
+
+## Cleaning Up
+
+<CodeGroup>
+```bash Stop Cluster
+make cluster-down
+```
+
+```bash Clean Data
+make cluster-clean
+```
+
+```bash Restart Fresh
+make cluster-restart
+```
+</CodeGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Detailed installation and deployment guide
+  </Card>
+  
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Understand the distributed system design
+  </Card>
+  
+  <Card title="Configuration" icon="sliders" href="/operations/configuration">
+    Advanced configuration options
+  </Card>
+  
+  <Card title="API Reference" icon="code" href="/api/walrus">
+    Complete API documentation
+  </Card>
+</CardGroup>

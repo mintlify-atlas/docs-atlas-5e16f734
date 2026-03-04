@@ -1,0 +1,547 @@
+---
+title: 'Configuration'
+description: 'Consistency models, fsync schedules, and tuning options for Walrus'
+---
+
+## Read Consistency Models
+
+Walrus provides two consistency models that control when read positions are persisted to disk. This affects both durability guarantees and read throughput.
+
+### ReadConsistency::StrictlyAtOnce
+
+Every checkpointed read is immediately persisted to disk. This provides **exactly-once** semantics - after a crash, reads resume from the last checkpointed position with no replays.
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce)?;
+
+wal.append_for_topic("events", b"event-1")?;
+wal.append_for_topic("events", b"event-2")?;
+
+// Each checkpointed read persists immediately
+wal.read_next("events", true)?;  // Persists: cursor at event-2
+// Process crashes here...
+
+// After restart, resumes from event-2 (no replay of event-1)
+let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce)?;
+let entry = wal.read_next("events", true)?.unwrap();
+assert_eq!(entry.data, b"event-2");
+```
+
+#### Characteristics
+
+<ParamField path="Durability" type="Maximum">
+  Every checkpoint is persisted before returning
+</ParamField>
+
+<ParamField path="Throughput" type="Lower">
+  Each checkpoint incurs disk I/O overhead
+</ParamField>
+
+<ParamField path="Replay After Crash" type="None">
+  Exactly-once semantics, no message replay
+</ParamField>
+
+<ParamField path="Use Case" type="Financial, Critical">
+  Financial transactions, audit logs, critical state machines
+</ParamField>
+
+#### Implementation
+
+From src/wal/runtime/walrus_read.rs:347-366:
+
+```rust
+fn should_persist(&self, info: &mut ColReaderInfo, force: bool) -> bool {
+    match self.read_consistency {
+        ReadConsistency::StrictlyAtOnce => true,  // Always persist
+        ReadConsistency::AtLeastOnce { .. } => { /* ... */ }
+    }
+}
+```
+
+Every `read_next` or `batch_read_for_topic` call with `checkpoint=true` writes to the read offset index immediately.
+
+### ReadConsistency::AtLeastOnce
+
+Read positions are persisted periodically (every N checkpoints). This provides **at-least-once** semantics - after a crash, up to N entries may be replayed.
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+// Persist every 1000 reads
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 }
+)?;
+
+wal.append_for_topic("events", b"event-1")?;
+wal.append_for_topic("events", b"event-2")?;
+wal.append_for_topic("events", b"event-3")?;
+
+// First 999 reads don't persist
+for _ in 0..999 {
+    wal.read_next("events", true)?;
+}
+
+// 1000th read persists checkpoint
+wal.read_next("events", true)?;  // Persists: cursor at entry 1000
+```
+
+<ParamField path="persist_every" type="u32" required>
+  Number of checkpointed reads between disk persists. Minimum value is 1.
+</ParamField>
+
+#### Characteristics
+
+<ParamField path="Durability" type="Relaxed">
+  Persists every N checkpoints
+</ParamField>
+
+<ParamField path="Throughput" type="Higher">
+  Amortizes disk I/O cost over N operations
+</ParamField>
+
+<ParamField path="Replay After Crash" type="Up to N entries">
+  At-least-once semantics, up to N messages may replay
+</ParamField>
+
+<ParamField path="Use Case" type="Analytics, Telemetry">
+  Event streams, analytics, idempotent message processing
+</ParamField>
+
+#### Implementation
+
+From src/wal/runtime/walrus_read.rs:347-366:
+
+```rust
+fn should_persist(&self, info: &mut ColReaderInfo, force: bool) -> bool {
+    match self.read_consistency {
+        ReadConsistency::StrictlyAtOnce => true,
+        ReadConsistency::AtLeastOnce { persist_every } => {
+            let every = persist_every.max(1);
+            if force {
+                info.reads_since_persist = 0;
+                return true;
+            }
+            let next = info.reads_since_persist.saturating_add(1);
+            if next >= every {
+                info.reads_since_persist = 0;
+                true
+            } else {
+                info.reads_since_persist = next;
+                false
+            }
+        }
+    }
+}
+```
+
+The reader tracks `reads_since_persist` in memory and only writes to disk every N reads.
+
+#### Choosing persist_every
+
+| Value | Replay Window | Throughput | Use Case |
+|-------|---------------|------------|----------|
+| 1 | None (same as StrictlyAtOnce) | Lowest | Testing, debugging |
+| 10-100 | Minimal | Medium | Low-volume streams |
+| 100-1000 | Moderate | High | Standard event processing |
+| 1000-10000 | Large | Very High | High-throughput analytics |
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+// Low replay window, good durability
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 100 }
+)?;
+
+// High throughput, larger replay window
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 5000 }
+)?;
+```
+
+### Comparison Example
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+use std::time::Instant;
+
+// StrictlyAtOnce: Lower throughput, no replay
+let wal1 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce)?;
+for i in 0..1000 {
+    wal1.append_for_topic("events", format!("event-{}", i).as_bytes())?;
+}
+
+let start = Instant::now();
+for _ in 0..1000 {
+    wal1.read_next("events", true)?;
+}
+println!("StrictlyAtOnce: {:?}", start.elapsed());
+// ~100ms (1000 disk writes)
+
+// AtLeastOnce: Higher throughput, potential replay
+let wal2 = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 100 }
+)?;
+for i in 0..1000 {
+    wal2.append_for_topic("events", format!("event-{}", i).as_bytes())?;
+}
+
+let start = Instant::now();
+for _ in 0..1000 {
+    wal2.read_next("events", true)?;
+}
+println!("AtLeastOnce(100): {:?}", start.elapsed());
+// ~10ms (10 disk writes)
+```
+
+## Fsync Scheduling
+
+Fsync scheduling controls when write data is flushed to disk. This is separate from read consistency and affects write durability.
+
+### FsyncSchedule::Milliseconds
+
+Flush dirty pages to disk every N milliseconds using a background worker thread. This is the **default** and provides a good balance of durability and throughput.
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+// Default: fsync every 200ms
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::Milliseconds(200)
+)?;
+
+// Custom interval: fsync every 500ms
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::Milliseconds(500)
+)?;
+```
+
+<ParamField path="interval_ms" type="u64" required>
+  Milliseconds between fsync operations. Typical values: 100-1000ms.
+</ParamField>
+
+#### Characteristics
+
+<ParamField path="Durability" type="Good">
+  Data persisted within the specified interval
+</ParamField>
+
+<ParamField path="Throughput" type="High">
+  Writes don't block on fsync
+</ParamField>
+
+<ParamField path="Data Loss Window" type="Up to N milliseconds">
+  Crash may lose writes from last N milliseconds
+</ParamField>
+
+<ParamField path="Use Case" type="Standard">
+  Default for most applications
+</ParamField>
+
+#### Implementation
+
+From src/wal/runtime/background.rs (background worker):
+
+```rust
+pub(super) fn start_background_workers(
+    fsync_schedule: FsyncSchedule,
+) -> Arc<mpsc::Sender<String>> {
+    let (tx, rx) = mpsc::channel::<String>();
+    let tx_arc = Arc::new(tx);
+    
+    if let FsyncSchedule::Milliseconds(interval_ms) = fsync_schedule {
+        std::thread::spawn(move || {
+            let interval = std::time::Duration::from_millis(interval_ms);
+            let mut pending_files = HashSet::new();
+            
+            loop {
+                std::thread::sleep(interval);
+                
+                // Drain channel
+                while let Ok(file_path) = rx.try_recv() {
+                    pending_files.insert(file_path);
+                }
+                
+                // Fsync all dirty files
+                for file_path in pending_files.drain() {
+                    if let Ok(mmap) = SharedMmapKeeper::get_mmap_arc(&file_path) {
+                        let _ = mmap.flush();
+                    }
+                }
+            }
+        });
+    }
+    
+    tx_arc
+}
+```
+
+### FsyncSchedule::SyncEach
+
+Fsync after every single write operation. This provides **maximum durability** at the cost of throughput.
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::SyncEach
+)?;
+
+// Each write blocks until data is on disk
+wal.append_for_topic("critical", b"transaction-1")?;  // Blocks on fsync
+wal.append_for_topic("critical", b"transaction-2")?;  // Blocks on fsync
+```
+
+#### Characteristics
+
+<ParamField path="Durability" type="Maximum">
+  Every write persisted before returning
+</ParamField>
+
+<ParamField path="Throughput" type="Lowest">
+  Each write blocks on disk I/O
+</ParamField>
+
+<ParamField path="Data Loss Window" type="None">
+  No data loss on crash
+</ParamField>
+
+<ParamField path="Use Case" type="Critical">
+  Financial transactions, compliance, critical state
+</ParamField>
+
+#### Implementation
+
+When using the FD backend on Unix, files are opened with `O_SYNC` flag for synchronous writes (src/wal/storage.rs:19-32):
+
+```rust
+fn new(path: &str, use_o_sync: bool) -> std::io::Result<Self> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true);
+    
+    #[cfg(unix)]
+    if use_o_sync {
+        opts.custom_flags(libc::O_SYNC);  // Every write is synchronous
+    }
+    
+    let file = opts.open(path)?;
+    Ok(Self { file, len })
+}
+```
+
+For mmap backend, each write is followed by `mmap.flush()` (src/wal/runtime/writer.rs:112-120).
+
+### FsyncSchedule::NoFsync
+
+**Never** fsync writes to disk. This provides **maximum throughput** with no durability guarantees. Use only for ephemeral data or when persistence is handled externally.
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::NoFsync
+)?;
+
+// Writes never block, data may be lost on crash
+wal.append_for_topic("cache", b"temporary-data")?;
+```
+
+#### Characteristics
+
+<ParamField path="Durability" type="None">
+  No durability guarantees
+</ParamField>
+
+<ParamField path="Throughput" type="Maximum">
+  No disk sync overhead
+</ParamField>
+
+<ParamField path="Data Loss Window" type="Unbounded">
+  Crash loses all unflushed data
+</ParamField>
+
+<ParamField path="Use Case" type="Testing, Caching">
+  Performance testing, ephemeral caches, development
+</ParamField>
+
+#### Implementation
+
+From src/wal/runtime/writer.rs:126-130:
+
+```rust
+FsyncSchedule::NoFsync => {
+    // No fsyncing at all - maximum throughput, no durability guarantees
+    debug_print!("[writer] no fsync: col={}, block_id={}", self.col, block.id);
+}
+```
+
+Writes complete immediately with no disk sync.
+
+### Fsync Schedule Comparison
+
+| Schedule | Durability | Throughput | Latency | Use Case |
+|----------|-----------|------------|---------|----------|
+| `SyncEach` | Maximum | ~5k writes/sec | High | Financial, Compliance |
+| `Milliseconds(100)` | Good | ~50k writes/sec | Low | Standard applications |
+| `Milliseconds(500)` | Fair | ~100k writes/sec | Very Low | High-throughput streams |
+| `NoFsync` | None | ~500k writes/sec | Minimal | Testing, Ephemeral data |
+
+## Combining Consistency and Fsync
+
+Read consistency and fsync schedule are independent settings:
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+// Maximum durability for both reads and writes
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::SyncEach
+)?;
+
+// Maximum throughput for both reads and writes
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 10000 },
+    FsyncSchedule::NoFsync
+)?;
+
+// Balanced: durable reads, batched write fsync
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::Milliseconds(200)
+)?;
+
+// High-throughput reads, maximum write durability
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 },
+    FsyncSchedule::SyncEach
+)?;
+```
+
+### Configuration Matrix
+
+| Workload | Read Consistency | Fsync Schedule | Reasoning |
+|----------|------------------|----------------|-----------|
+| Financial transactions | `StrictlyAtOnce` | `SyncEach` | Zero data loss required |
+| Order processing | `StrictlyAtOnce` | `Milliseconds(100)` | Durable reads, batched writes |
+| Event streaming | `AtLeastOnce(1000)` | `Milliseconds(500)` | High throughput, idempotent |
+| Analytics pipeline | `AtLeastOnce(5000)` | `Milliseconds(1000)` | Maximum throughput |
+| Cache write-through | `AtLeastOnce(100)` | `NoFsync` | Fast writes, acceptable loss |
+| Development/Testing | `StrictlyAtOnce` | `NoFsync` | Fast iteration, predictable |
+
+## Constructor Overview
+
+### Basic Constructors
+
+```rust
+use walrus_rust::Walrus;
+
+// Default: StrictlyAtOnce + Milliseconds(200)
+let wal = Walrus::new()?;
+
+// Custom consistency, default fsync
+let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce)?;
+
+// Full configuration
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 },
+    FsyncSchedule::Milliseconds(500)
+)?;
+```
+
+### Namespaced Constructors
+
+```rust
+use walrus_rust::Walrus;
+
+// Default configuration, namespaced
+let wal = Walrus::new_for_key("tenant-123")?;
+
+// Custom consistency, namespaced
+let wal = Walrus::with_consistency_for_key(
+    "tenant-123",
+    ReadConsistency::StrictlyAtOnce
+)?;
+
+// Full configuration, namespaced
+let wal = Walrus::with_consistency_and_schedule_for_key(
+    "tenant-123",
+    ReadConsistency::AtLeastOnce { persist_every: 100 },
+    FsyncSchedule::Milliseconds(200)
+)?;
+```
+
+### Builder API
+
+```rust
+use walrus_rust::Walrus;
+use std::path::PathBuf;
+
+let wal = Walrus::builder()
+    .data_dir(PathBuf::from("/var/lib/myapp/wal"))
+    .key("tenant-123")
+    .consistency(ReadConsistency::StrictlyAtOnce)
+    .fsync_schedule(FsyncSchedule::Milliseconds(500))
+    .build()?;
+```
+
+From src/wal/runtime/builder.rs:26-104, the builder provides explicit control over all configuration options.
+
+## Performance Tuning Guidelines
+
+### Optimize for Throughput
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 5000 },
+    FsyncSchedule::Milliseconds(1000)
+)?;
+```
+
+- Use `AtLeastOnce` with high `persist_every` (1000-10000)
+- Use `Milliseconds` with high interval (500-1000ms)
+- Ensure idempotent message processing to handle replays
+
+### Optimize for Durability
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::SyncEach
+)?;
+```
+
+- Use `StrictlyAtOnce` for reads
+- Use `SyncEach` for writes
+- Accept lower throughput (~5k writes/sec)
+
+### Balanced Configuration
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::Milliseconds(200)
+)?;
+```
+
+- `StrictlyAtOnce` ensures no read replays
+- `Milliseconds(200)` batches write fsyncs
+- Good for most applications (~50k writes/sec)
+
+## Next Steps
+
+- [Storage Backends](/library/storage-backends) - FD vs mmap backend selection
+- [Batch Operations](/library/batch-operations) - High-throughput batch APIs
+- [Basic Operations](/library/basic-operations) - Understanding read/write operations

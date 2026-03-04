@@ -1,0 +1,413 @@
+---
+title: 'Cluster Deployment'
+description: 'Deploy a distributed Walrus cluster with Docker Compose or manually'
+---
+
+## Prerequisites
+
+- **Minimum nodes**: 3 (for Raft quorum)
+- **Rust**: 1.70+ (for manual builds)
+- **Docker & Docker Compose**: Latest (for containerized deployment)
+- **Network**: All nodes must be able to communicate on Raft and client ports
+
+<Warning>
+A 2-node cluster will not achieve quorum. Always deploy at least 3 nodes for production use.
+</Warning>
+
+## Quick Start: Docker Compose
+
+The fastest way to get a 3-node cluster running locally.
+
+### 1. Start the Cluster
+
+```bash
+cd distributed-walrus
+make cluster-up
+```
+
+This command:
+- Builds the Docker image from the Dockerfile
+- Starts 3 nodes: `walrus-1`, `walrus-2`, `walrus-3`
+- Exposes client ports: 9091, 9092, 9093
+- Creates a bridge network for internal communication
+
+### 2. Wait for Bootstrap
+
+```bash
+make cluster-bootstrap
+```
+
+This waits for all client ports to become available and ensures Node 1 has completed bootstrap.
+
+### 3. Verify Cluster Health
+
+Connect to any node and check metrics:
+
+```bash
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091
+```
+
+Inside the CLI:
+
+```
+> METRICS
+```
+
+Look for:
+- `current_leader`: Should be `1` after bootstrap
+- `state`: Should be `Leader` on Node 1, `Follower` on others
+- `membership`: Should show all 3 nodes
+
+### 4. Test Basic Operations
+
+```bash
+> REGISTER logs
+OK
+
+> PUT logs "hello from distributed cluster"
+OK
+
+> GET logs
+OK hello from distributed cluster
+
+> STATE logs
+{
+  "current_segment": 1,
+  "leader_node": 1,
+  "sealed_segments": {},
+  "segment_leaders": { "1": 1 }
+}
+```
+
+### 5. Shutdown
+
+```bash
+make cluster-down
+```
+
+## Docker Compose Configuration
+
+The `docker-compose.yml` defines the cluster topology:
+
+```yaml
+services:
+  node1:
+    build:
+      context: ..
+      dockerfile: distributed-walrus/Dockerfile
+    container_name: walrus-1
+    hostname: node1
+    command:
+      - "--node-id=1"
+      - "--data-dir=/data"
+      - "--raft-host=0.0.0.0"
+      - "--raft-advertise-host=node1"
+      - "--raft-port=6001"
+      - "--client-host=0.0.0.0"
+      - "--client-port=9091"
+    environment:
+      - RUST_LOG=info
+      - WALRUS_DISABLE_IO_URING=1
+      - WALRUS_MAX_SEGMENT_ENTRIES=1000000
+      - WALRUS_MONITOR_CHECK_MS=10000
+    volumes:
+      - ./test_data/node1:/data
+    ports:
+      - "9091:9091"
+    networks:
+      - walrus-net
+
+  node2:
+    container_name: walrus-2
+    hostname: node2
+    depends_on:
+      - node1
+    command:
+      - "--node-id=2"
+      - "--join=node1:6001"  # Join Node 1's Raft port
+      - ...
+    ports:
+      - "9092:9092"
+
+  node3:
+    container_name: walrus-3
+    hostname: node3
+    depends_on:
+      - node1
+    command:
+      - "--node-id=3"
+      - "--join=node1:6001"  # Join Node 1's Raft port
+      - ...
+    ports:
+      - "9093:9093"
+```
+
+<Accordion title="Key Configuration Points">
+  - **`--raft-host=0.0.0.0`**: Binds Raft listener to all interfaces (required in containers)
+  - **`--raft-advertise-host=node1`**: Hostname advertised to peers for RPC
+  - **`--join=node1:6001`**: Non-bootstrap nodes join via Node 1's Raft port
+  - **`WALRUS_DISABLE_IO_URING=1`**: Uses mmap instead of io_uring (container compatibility)
+  - **`privileged: true`**: Required for some file system operations
+</Accordion>
+
+## Manual Deployment
+
+Deploy nodes manually without Docker for production or bare-metal setups.
+
+### 1. Build the Binary
+
+```bash
+cargo build --release --manifest-path distributed-walrus/Cargo.toml
+```
+
+Binary location: `target/release/distributed-walrus`
+
+### 2. Node 1 (Bootstrap Leader)
+
+Start the first node which will become the initial Raft leader:
+
+```bash
+./target/release/distributed-walrus \
+  --node-id 1 \
+  --data-dir ./data \
+  --raft-port 6001 \
+  --raft-host 0.0.0.0 \
+  --raft-advertise-host 192.168.1.10 \
+  --client-port 9091 \
+  --client-host 0.0.0.0
+```
+
+**Node 1 will:**
+- Bootstrap as the Raft leader
+- Create the initial `"logs"` topic
+- Start accepting client connections on `:9091`
+
+<Info>
+Replace `192.168.1.10` with the actual IP address that other nodes can reach. For local testing, use `127.0.0.1`.
+</Info>
+
+### 3. Node 2 (Join Cluster)
+
+Start the second node and join the cluster:
+
+```bash
+./target/release/distributed-walrus \
+  --node-id 2 \
+  --data-dir ./data \
+  --raft-port 6002 \
+  --raft-host 0.0.0.0 \
+  --raft-advertise-host 192.168.1.11 \
+  --client-port 9092 \
+  --client-host 0.0.0.0 \
+  --join 192.168.1.10:6001
+```
+
+**Node 2 will:**
+- Contact Node 1 at `192.168.1.10:6001`
+- Join as a Raft learner
+- Sync metadata from the leader
+- Get promoted to voting member automatically
+
+### 4. Node 3 (Join Cluster)
+
+Start the third node:
+
+```bash
+./target/release/distributed-walrus \
+  --node-id 3 \
+  --data-dir ./data \
+  --raft-port 6003 \
+  --raft-host 0.0.0.0 \
+  --raft-advertise-host 192.168.1.12 \
+  --client-port 9093 \
+  --client-host 0.0.0.0 \
+  --join 192.168.1.10:6001
+```
+
+### 5. Verify Cluster Formation
+
+Check logs for successful join:
+
+```
+Node 1: Added learner 2
+Node 1: Promoted learner 2
+Node 1: Added learner 3
+Node 1: Promoted learner 3
+```
+
+Query metrics from any node:
+
+```bash
+curl http://localhost:9091/metrics  # or use walrus-cli
+```
+
+## Configuration Reference
+
+### Command-Line Flags
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--node-id` | Yes | - | Unique node identifier (1, 2, 3, ...) |
+| `--data-dir` | No | `./data` | Root directory for storage |
+| `--raft-port` | No | `6000` | Port for Raft/internal RPC |
+| `--raft-host` | No | `127.0.0.1` | Raft bind address |
+| `--raft-advertise-host` | No | (raft-host) | Address advertised to peers |
+| `--client-port` | No | `8080` | Client TCP port |
+| `--client-host` | No | `127.0.0.1` | Client bind address |
+| `--join` | No | - | Address of existing node to join |
+| `--log-file` | No | - | File to write logs (stdout if not set) |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RUST_LOG` | `info` | Log level: `debug`, `info`, `warn`, `error` |
+| `WALRUS_MAX_SEGMENT_ENTRIES` | `1000000` | Entries before segment rollover |
+| `WALRUS_MONITOR_CHECK_MS` | `10000` | Monitor loop interval (ms) |
+| `WALRUS_DISABLE_IO_URING` | (unset) | Set to `1` to use mmap instead of io_uring |
+
+<Tip>
+For high write throughput, lower `WALRUS_MAX_SEGMENT_ENTRIES` (e.g., 100K) to trigger more frequent rollovers and distribute load across nodes faster.
+</Tip>
+
+## Data Directory Structure
+
+Each node stores data in separate directories:
+
+```
+data/
+├── node_1/
+│   ├── user_data/          # Walrus WAL files (actual log data)
+│   │   ├── logs:1.wal
+│   │   ├── logs:2.wal
+│   │   └── ...
+│   └── raft_meta/          # Raft metadata (consensus log)
+│       ├── snapshot.bin
+│       └── entries.log
+├── node_2/
+│   ├── user_data/
+│   └── raft_meta/
+└── node_3/
+    ├── user_data/
+    └── raft_meta/
+```
+
+<Warning>
+**Do not** share data directories between nodes. Each node must have its own isolated storage.
+</Warning>
+
+## Production Deployment Considerations
+
+### Network Configuration
+
+1. **Firewall rules**:
+   - Open client ports (9091-9093) for application traffic
+   - Open Raft ports (6001-6003) only between cluster nodes
+   - Do NOT expose Raft ports to the public internet
+
+2. **DNS/Hostnames**:
+   - Use stable hostnames or IPs for `--raft-advertise-host`
+   - Consider using a load balancer for client connections
+
+### Hardware Requirements
+
+Minimum per node:
+- **CPU**: 2+ cores
+- **RAM**: 4GB+ (depends on segment size and concurrency)
+- **Disk**: SSD recommended for Walrus WAL performance
+- **Network**: Low latency between nodes (< 10ms ideal for Raft)
+
+### Monitoring
+
+Set up monitoring for:
+- Raft leader stability (`METRICS` command)
+- Segment rollover frequency
+- Write latency (local vs. forwarded)
+- Disk usage in `data_wal_dir`
+
+### Backup Strategy
+
+Backup requirements:
+- **Raft metadata** (`raft_meta/`): Small, critical for cluster state
+- **User data** (`user_data/`): Large, actual log data
+
+Options:
+1. Snapshot the entire `data/` directory per node
+2. Use Walrus's built-in snapshot capabilities for sealed segments
+3. Stream data to object storage for long-term retention
+
+## Hot-Join a New Node
+
+Add a 4th node to an existing 3-node cluster:
+
+```bash
+./target/release/distributed-walrus \
+  --node-id 4 \
+  --raft-port 6004 \
+  --client-port 9094 \
+  --join 192.168.1.10:6001
+```
+
+The node will:
+1. Join as a learner
+2. Sync metadata from the leader
+3. Automatically promote to voter after catching up (~60 seconds)
+
+<Check>
+New segments created after the join will distribute leadership across all nodes, including the new one.
+</Check>
+
+## Troubleshooting
+
+### "No Raft leader known"
+
+**Cause**: Cluster hasn't completed bootstrap or lost quorum.
+
+**Solution**:
+- Check network connectivity between nodes
+- Verify at least 2 of 3 nodes are running
+- Review logs for election timeout errors
+
+### "NotLeaderForPartition" errors
+
+**Cause**: Node doesn't hold lease for the segment.
+
+**Solution**:
+- Wait 100ms for lease sync to complete
+- Check `STATE <topic>` to see current leader
+- Verify Raft metadata is consistent across nodes
+
+### "Failed to join cluster"
+
+**Cause**: Cannot reach the join target.
+
+**Solution**:
+- Verify `--join` address is correct
+- Ensure Raft port (6001) is accessible
+- Check Node 1 is fully bootstrapped (wait 20-30 seconds after start)
+
+### Ports already in use
+
+**Cause**: Previous instance not cleaned up.
+
+**Solution**:
+```bash
+# Find and kill processes
+lsof -i :9091
+kill <PID>
+
+# Or clean Docker
+make cluster-down
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Client Protocol" icon="code" href="/cluster/client-protocol">
+    Learn the TCP protocol commands
+  </Card>
+  
+  <Card title="Failure Recovery" icon="life-ring" href="/cluster/failure-recovery">
+    Handle node failures and recovery
+  </Card>
+</CardGroup>

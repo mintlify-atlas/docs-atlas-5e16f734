@@ -1,0 +1,293 @@
+---
+title: "FsyncSchedule"
+description: "Configure when data is flushed to disk for durability control"
+---
+
+The `FsyncSchedule` enum controls when write operations are synchronized to disk, allowing you to balance durability guarantees against write performance.
+
+## Enum Definition
+
+```rust
+pub enum FsyncSchedule {
+    Milliseconds(u64),
+    SyncEach,
+    NoFsync,
+}
+```
+
+## Variants
+
+### Milliseconds
+
+Flushes data to disk at regular time intervals.
+
+```rust
+FsyncSchedule::Milliseconds(u64)
+```
+
+<ParamField path="interval" type="u64" required>
+  Time interval in milliseconds between fsync operations. The default is 200ms.
+</ParamField>
+
+**Behavior:**
+- Background worker performs fsync every N milliseconds
+- Batches multiple writes into a single fsync operation
+- Balanced durability and performance
+
+**Durability:**
+- Data written in the last N milliseconds may be lost on crash
+- Recovery window is bounded by the interval
+
+**Performance:**
+- Good throughput with periodic disk flushes
+- Amortizes fsync cost across multiple writes
+
+**Use Cases:**
+- Most production workloads
+- Applications with acceptable recovery windows
+- Event streaming and logging systems
+
+**Example:**
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+// Fsync every 500ms
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::Milliseconds(500)
+)?;
+```
+
+### SyncEach
+
+Flushes data to disk after every single write operation.
+
+```rust
+FsyncSchedule::SyncEach
+```
+
+**Behavior:**
+- Calls fsync immediately after each write
+- On FD backend: Opens files with `O_SYNC` flag for synchronous writes
+- Maximum durability guarantee
+
+**Durability:**
+- Every write is guaranteed to be on disk before returning
+- No data loss on crash (within consistency model limits)
+- Highest durability guarantee available
+
+**Performance:**
+- Lowest throughput due to synchronous disk operations
+- Each write operation waits for disk confirmation
+- Not suitable for high-frequency writes
+
+**Use Cases:**
+- Financial transactions
+- Critical configuration updates
+- Systems with zero data loss tolerance
+- Compliance requirements for durability
+
+**Example:**
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+// Maximum durability - fsync after every write
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::SyncEach
+)?;
+
+// This write will not return until data is on disk
+wal.append_for_topic("critical", b"transaction-123")?;
+```
+
+### NoFsync
+
+Disables fsync entirely, relying on OS buffer cache.
+
+```rust
+FsyncSchedule::NoFsync
+```
+
+**Behavior:**
+- Never calls fsync
+- Data is written to OS buffer cache only
+- OS controls when data is flushed to disk
+
+**Durability:**
+- No durability guarantees
+- All unflushed data may be lost on crash or power failure
+- Suitable only for ephemeral or easily-reproducible data
+
+**Performance:**
+- Maximum write throughput
+- No waiting for disk operations
+- Best performance for write-heavy workloads
+
+**Use Cases:**
+- Development and testing
+- Caches and temporary data
+- Data that can be rebuilt from other sources
+- Performance benchmarking
+
+**Warning:**
+This mode provides NO durability guarantees. Only use when data loss is acceptable.
+
+**Example:**
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+// Maximum throughput - no fsync (NO DURABILITY)
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 10000 },
+    FsyncSchedule::NoFsync
+)?;
+```
+
+## Default Configuration
+
+When using `Walrus::new()` or `Walrus::with_consistency()`:
+
+```rust
+// Default: 200ms fsync interval
+FsyncSchedule::Milliseconds(200)
+```
+
+## Choosing a Schedule
+
+| Requirement | Recommended Schedule |
+|-------------|---------------------|
+| Zero data loss tolerance | `SyncEach` |
+| Balanced durability/performance | `Milliseconds(200)` (default) |
+| High write throughput | `Milliseconds(1000)` or higher |
+| Maximum performance | `NoFsync` (testing/cache only) |
+| Sub-second recovery window | `Milliseconds(100)` or lower |
+| Financial transactions | `SyncEach` |
+| Event logging | `Milliseconds(500)` |
+
+## Data Loss Window
+
+The maximum data loss window with different schedules:
+
+| Schedule | Max Data Loss Window |
+|----------|---------------------|
+| `SyncEach` | 0 (no loss within consistency model) |
+| `Milliseconds(100)` | Last 100ms of writes |
+| `Milliseconds(200)` | Last 200ms of writes |
+| `Milliseconds(1000)` | Last 1 second of writes |
+| `NoFsync` | All unflushed data (potentially unbounded) |
+
+## Interaction with ReadConsistency
+
+The fsync schedule applies to **write operations**, while `ReadConsistency` applies to **read checkpoint persistence**.
+
+### Maximum Durability (Both Reads and Writes)
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,  // Persist read checkpoints immediately
+    FsyncSchedule::SyncEach            // Fsync after every write
+)?;
+```
+
+### Balanced Configuration
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 100 },  // Batch checkpoint updates
+    FsyncSchedule::Milliseconds(200)                       // Periodic fsync
+)?;
+```
+
+### Maximum Throughput (Testing Only)
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 10000 },
+    FsyncSchedule::NoFsync  // NO DURABILITY
+)?;
+```
+
+## Backend-Specific Behavior
+
+### FD Backend with SyncEach
+
+When using the FD (file descriptor) backend with `SyncEach`:
+
+- Files are opened with the `O_SYNC` flag
+- Every write operation is synchronous at the kernel level
+- No separate fsync call needed
+
+```rust
+use walrus_rust::{enable_fd_backend, Walrus, ReadConsistency, FsyncSchedule};
+
+enable_fd_backend();  // Use FD backend
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::SyncEach  // Opens files with O_SYNC
+)?;
+```
+
+### Mmap Backend
+
+The mmap backend handles all schedules but may have different performance characteristics:
+
+```rust
+use walrus_rust::{disable_fd_backend, Walrus, ReadConsistency, FsyncSchedule};
+
+disable_fd_backend();  // Use mmap backend
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::Milliseconds(200)
+)?;
+```
+
+## Configuration Examples
+
+### Production Default
+
+```rust
+use walrus_rust::Walrus;
+
+// Uses: Milliseconds(200)
+let wal = Walrus::new()?;
+```
+
+### Low-Latency Durability
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::Milliseconds(100)  // 100ms recovery window
+)?;
+```
+
+### High-Throughput Logging
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 },
+    FsyncSchedule::Milliseconds(1000)  // 1 second recovery window
+)?;
+```
+
+## Related Types
+
+- [Walrus](/api/walrus) - Main WAL instance
+- [ReadConsistency](/api/read-consistency) - Controls read checkpoint persistence
+- [Entry (WalEntry)](/api/wal-entry) - Structure returned by read operations

@@ -1,0 +1,421 @@
+---
+title: Monitoring
+description: Monitor Walrus cluster health, metrics, and operational status in production
+---
+
+Effective monitoring is crucial for operating Walrus in production. This guide covers the metrics available, how to access them, and what to monitor for healthy cluster operation.
+
+## METRICS Command
+
+The primary way to monitor a Walrus cluster is through the `METRICS` command, which returns a JSON snapshot of Raft consensus state and cluster health.
+
+### Using the CLI
+
+```bash
+# Connect to any node
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091
+
+# In the interactive shell
+> METRICS
+```
+
+### Example Output
+
+```json
+{
+  "id": 1,
+  "state": "Leader",
+  "current_term": 5,
+  "vote": {
+    "term": 5,
+    "node_id": 1,
+    "committed": true
+  },
+  "last_log_index": 142,
+  "last_applied": 142,
+  "current_leader": 1,
+  "membership_config": {
+    "nodes": [1, 2, 3],
+    "voters": [1, 2, 3],
+    "learners": []
+  },
+  "snapshot": {
+    "index": 100,
+    "term": 4
+  },
+  "replication": {
+    "2": {
+      "match_index": 142,
+      "next_index": 143
+    },
+    "3": {
+      "match_index": 142,
+      "next_index": 143
+    }
+  }
+}
+```
+
+## Key Metrics to Monitor
+
+### Cluster Health Metrics
+
+<ParamField path="state" type="string">
+  Current Raft state of this node. Valid values: `Leader`, `Follower`, `Candidate`.
+  
+  **Expected**: One node should be `Leader`, all others should be `Follower`.
+  
+  **Alert if**: Multiple nodes report `Leader` (split-brain) or all nodes report `Candidate` (no quorum).
+</ParamField>
+
+<ParamField path="current_leader" type="integer">
+  Node ID of the current Raft leader.
+  
+  **Expected**: All nodes report the same leader ID.
+  
+  **Alert if**: Nodes disagree on leader, or `null` (no leader elected).
+</ParamField>
+
+<ParamField path="current_term" type="integer">
+  Current Raft term number. Increases with each leader election.
+  
+  **Expected**: Slowly increasing over time (only during planned restarts or failures).
+  
+  **Alert if**: Rapidly increasing (indicates frequent elections / network issues).
+</ParamField>
+
+### Replication Health
+
+<ParamField path="replication" type="object">
+  Per-follower replication status (only present on leader).
+  
+  ```json
+  "replication": {
+    "2": {
+      "match_index": 142,  // Last replicated log entry
+      "next_index": 143    // Next entry to send
+    }
+  }
+  ```
+  
+  **Expected**: `match_index` close to `last_log_index` (< 100 entries behind).
+  
+  **Alert if**: Large gap between `match_index` and `last_log_index` (follower lagging).
+</ParamField>
+
+<ParamField path="last_log_index" type="integer">
+  Index of the last entry in the Raft log.
+  
+  **Expected**: Monotonically increasing as cluster metadata changes occur.
+</ParamField>
+
+<ParamField path="last_applied" type="integer">
+  Index of the last entry applied to the state machine.
+  
+  **Expected**: Equal to `last_log_index` (all committed entries applied).
+  
+  **Alert if**: `last_applied` significantly behind `last_log_index`.
+</ParamField>
+
+### Membership Configuration
+
+<ParamField path="membership_config" type="object">
+  Current cluster membership.
+  
+  ```json
+  "membership_config": {
+    "nodes": [1, 2, 3],      // All known nodes
+    "voters": [1, 2, 3],      // Voting members
+    "learners": []            // Non-voting members
+  }
+  ```
+  
+  **Expected**: All expected nodes present in `voters`.
+  
+  **Alert if**: Missing nodes or unexpected learners.
+</ParamField>
+
+## STATE Command (Topic Metadata)
+
+Use the `STATE` command to inspect individual topic configuration and segment status:
+
+```bash
+> STATE logs
+```
+
+### Example Output
+
+```json
+{
+  "topic": "logs",
+  "current_segment": 3,
+  "leader_node": 2,
+  "sealed_segments": {
+    "1": 1000000,
+    "2": 950000
+  },
+  "segment_leaders": {
+    "1": 1,
+    "2": 3,
+    "3": 2
+  }
+}
+```
+
+### Topic Health Metrics
+
+<ParamField path="current_segment" type="integer">
+  Active segment ID currently accepting writes.
+  
+  **Expected**: Increases over time as segments roll over.
+</ParamField>
+
+<ParamField path="leader_node" type="integer">
+  Node ID responsible for the current segment.
+  
+  **Expected**: Rotates across cluster nodes with each rollover.
+</ParamField>
+
+<ParamField path="sealed_segments" type="object">
+  Map of segment ID to final entry count for completed segments.
+  
+  **Expected**: Entry counts close to `WALRUS_MAX_SEGMENT_ENTRIES`.
+</ParamField>
+
+<ParamField path="segment_leaders" type="object">
+  Historical record of which node led each segment.
+  
+  **Use case**: Identify where to read sealed segment data.
+</ParamField>
+
+## System-Level Monitoring
+
+### Log Monitoring
+
+Monitor logs for errors and warnings using standard log aggregation tools:
+
+```bash
+# Set log level
+export RUST_LOG=info,walrus=debug
+
+# Log to file
+cargo run -- --node-id 1 --log-file /var/log/walrus/node-1.log
+```
+
+#### Critical Log Patterns
+
+<Warning>
+**ERROR** patterns to alert on:
+- `"monitor tick failed"` - Rollover monitor issues
+- `"Raft consensus failed"` - Consensus problems
+- `"NotLeaderError"` - Unexpected write to non-leader
+- `"Lease sync failed"` - Lease synchronization issues
+</Warning>
+
+<Info>
+**INFO** patterns indicating normal operation:
+- `"Node 1 booting"` - Startup
+- `"Registered node address"` - Successful registration
+- `"Monitor loop started"` - Background tasks running
+- `"Client listener bound"` - Ready to accept connections
+</Info>
+
+### Disk Space Monitoring
+
+Monitor disk usage for the data directory:
+
+```bash
+# Check disk usage per node
+du -sh /path/to/data/node_*
+
+# Monitor WAL file growth
+ls -lh /path/to/data/node_1/user_data/data_plane/
+```
+
+<Tip>
+Calculate expected disk usage:
+- Each segment: ~100-200MB (depending on entry size)
+- With `WALRUS_MAX_SEGMENT_ENTRIES=1000000`: ~100MB per segment
+- Plan for: `(write_rate / WALRUS_MAX_SEGMENT_ENTRIES) * segment_size * retention_period`
+</Tip>
+
+### Network Monitoring
+
+Monitor inter-node communication:
+
+<CodeGroup>
+```bash Raft Port Traffic
+# Monitor Raft consensus traffic (port 6001-6003)
+netstat -an | grep 600[1-3]
+```
+
+```bash Client Port Traffic
+# Monitor client connections (port 9091-9093)
+netstat -an | grep 909[1-3]
+```
+</CodeGroup>
+
+**Expected traffic patterns**:
+- Raft leader → followers: Regular heartbeats (every ~150ms)
+- Client → any node: Request/response traffic
+- Non-leader → leader: Forwarded write operations
+
+## Prometheus Integration (Future)
+
+While Walrus doesn't currently expose Prometheus metrics directly, you can build a scraper using the METRICS command:
+
+```python
+import requests
+import json
+from prometheus_client import Gauge, start_http_server
+
+# Example metrics
+raft_term = Gauge('walrus_raft_term', 'Current Raft term', ['node_id'])
+raft_log_index = Gauge('walrus_raft_log_index', 'Last log index', ['node_id'])
+raft_leader = Gauge('walrus_raft_is_leader', 'Is this node the leader', ['node_id'])
+
+def scrape_metrics(node_addr, node_id):
+    # Connect and send METRICS command
+    # Parse JSON response
+    # Update Prometheus gauges
+    pass
+
+if __name__ == '__main__':
+    start_http_server(8000)
+    # Scrape loop...
+```
+
+## Health Checks
+
+Implement health checks for load balancers and orchestration systems:
+
+### Basic Health Check
+
+```bash
+# Simple connection test
+echo -ne '\x06\x00\x00\x00METRICS' | nc 127.0.0.1 9091 | head -c 4
+# Should return 4-byte length prefix if healthy
+```
+
+### Leader Check
+
+```bash
+# Check if node is the Raft leader
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 metrics | \
+  jq -e '.state == "Leader"'
+# Exit code 0 if leader, 1 otherwise
+```
+
+### Write Health Check
+
+```bash
+# Verify writes are working
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 put health-check "$(date +%s)"
+# Should return "OK" if healthy
+```
+
+## Monitoring Dashboards
+
+### Essential Metrics Dashboard
+
+Create a monitoring dashboard with these panels:
+
+<AccordionGroup>
+  <Accordion title="Cluster Overview">
+    - **Raft state**: Visual indicator per node (Leader/Follower/Candidate)
+    - **Current term**: Line graph showing election frequency
+    - **Leader ID**: Single value showing current leader
+    - **Quorum status**: Boolean (healthy/unhealthy)
+  </Accordion>
+
+  <Accordion title="Replication Status">
+    - **Replication lag**: Per-follower lag in log entries
+    - **Last applied index**: Ensure state machine is caught up
+    - **Snapshot status**: Last snapshot index and term
+  </Accordion>
+
+  <Accordion title="Topic Health">
+    - **Active segments**: Current segment ID per topic
+    - **Segment distribution**: Leader distribution across nodes
+    - **Rollover frequency**: Segments created over time
+  </Accordion>
+
+  <Accordion title="System Resources">
+    - **Disk usage**: Per-node data directory size
+    - **Network traffic**: Raft + client port traffic rates
+    - **Log errors**: Count of ERROR log lines per minute
+  </Accordion>
+</AccordionGroup>
+
+## Alerting Rules
+
+Configure alerts for critical conditions:
+
+### Critical Alerts
+
+<Warning>
+**Immediate Response Required**
+- No Raft leader for > 30 seconds
+- Follower replication lag > 1000 entries
+- Disk usage > 85%
+- Multiple nodes claiming leadership
+- Write operations failing consistently
+</Warning>
+
+### Warning Alerts
+
+<Info>
+**Investigation Recommended**
+- Frequent leader elections (> 1 per hour)
+- Follower replication lag > 100 entries
+- Disk usage > 70%
+- Elevated error log rates
+- Slow rollover processing
+</Info>
+
+## Monitoring Best Practices
+
+<Steps>
+  <Step title="Poll METRICS regularly">
+    Query each node every 10-30 seconds for metrics collection
+  </Step>
+  
+  <Step title="Monitor all nodes">
+    Don't just monitor the leader - follower health is equally important
+  </Step>
+  
+  <Step title="Track trends over time">
+    Watch for gradual degradation: increasing lag, slower rollovers, growing disk usage
+  </Step>
+  
+  <Step title="Set up log aggregation">
+    Centralize logs from all nodes for correlation and analysis
+  </Step>
+  
+  <Step title="Test your alerts">
+    Regularly test alerting by simulating failures (stop a node, network partition)
+  </Step>
+</Steps>
+
+## Troubleshooting with Metrics
+
+See the [Troubleshooting](/operations/troubleshooting) guide for specific issues, but here are quick diagnostic patterns:
+
+| Symptom | Check These Metrics | Likely Cause |
+|---------|-------------------|--------------|
+| Writes failing | `current_leader`, `state` | No leader elected |
+| Slow reads | `segment_leaders`, `STATE` | Reading from wrong node |
+| Frequent elections | `current_term` (rapidly increasing) | Network instability |
+| Lag warnings | `replication[N].match_index` | Follower overloaded |
+| Out of disk | Disk usage + `sealed_segments` | Retention not configured |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Performance Tuning" icon="gauge-high" href="/operations/performance-tuning">
+    Optimize cluster performance
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/operations/troubleshooting">
+    Diagnose and fix common issues
+  </Card>
+</CardGroup>

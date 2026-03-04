@@ -1,0 +1,271 @@
+---
+title: Formal Verification
+description: TLA+ specification and verified correctness properties of the Walrus distributed data plane
+---
+
+Walrus includes a formal TLA+ specification that models the distributed data plane, providing mathematical guarantees about system correctness under concurrent operations.
+
+## Specification Overview
+
+The TLA+ specification models the core distributed Walrus data plane with:
+
+- **Segment-based sharding**: Topics split into numbered segments with independent leaders
+- **Lease-based write fencing**: Only designated leaders can write to their segments
+- **Cursor advancement**: Reader progression across sealed and active segments
+- **Raft abstraction**: Metadata treated as single authoritative source
+
+<Note>
+The specification is located at `distributed-walrus/spec/DistributedWalrus.tla` in the source repository.
+</Note>
+
+## Model Structure
+
+### Constants
+
+The specification is parameterized by:
+
+| Constant | Description | Example Value |
+|----------|-------------|---------------|
+| `Nodes` | Set of node IDs eligible to lead segments | `{1, 2, 3}` |
+| `Topics` | Universe of topic names | `{"logs", "metrics"}` |
+| `SegIds` | Finite set of allowed segment IDs | `{1, 2, 3}` |
+| `MaxSegmentEntries` | Rollover threshold for segments | `2` (for model checking) |
+
+### State Variables
+
+The system state consists of four variables:
+
+```tla
+topics      // Set of created topics
+topicInfo   // Per-topic metadata: current segment, leader, sealed counts
+wal         // Per-topic, per-segment entry sequences
+readers     // Per-topic read cursors (segment, delivered count)
+```
+
+### Actions
+
+The specification models four core operations:
+
+<CardGroup cols={2}>
+  <Card title="CreateTopic" icon="plus">
+    Initialize a new topic with a designated leader and first segment.
+  </Card>
+  <Card title="WalAppend" icon="pen">
+    Append an entry to the current open segment (only by the leader).
+  </Card>
+  <Card title="Rollover" icon="rotate">
+    Seal the current segment and create a new one with a new leader.
+  </Card>
+  <Card title="Read" icon="book">
+    Advance the reader cursor within the current segment or move to the next sealed segment.
+  </Card>
+</CardGroup>
+
+## Verified Invariants
+
+The TLC model checker verifies the following safety properties hold in all reachable states:
+
+### Domain Consistency
+
+```tla
+InvDomainConsistency ==
+    /\ DOMAIN topicInfo = topics
+    /\ DOMAIN wal = topics
+    /\ DOMAIN readers = topics
+```
+
+Ensures that topic metadata, WAL entries, and reader cursors stay synchronized across all operations.
+
+### Single Writer per Segment
+
+```tla
+InvOpenLeaderMatchesMap ==
+    \A t \in topics : 
+        topicInfo[t].segmentLeaders[OpenSegment(t)] = topicInfo[t].leader
+```
+
+Guarantees only the designated leader for a segment can write to it, preventing split-brain writes.
+
+<Warning>
+This invariant is critical for data consistency. Lease-based write fencing in the implementation ensures this property holds even during network partitions.
+</Warning>
+
+### No Writes Past Open Segment
+
+```tla
+InvNoWritesPastOpen ==
+    \A t \in topics :
+        \A s \in SegIds : s > OpenSegment(t) => Len(wal[t][s]) = 0
+```
+
+Closed segments remain immutable after rollover. Only the current open segment accepts writes.
+
+### Sealed Counts Stable
+
+```tla
+InvSealedCountsStable ==
+    \A t \in topics :
+        \A s \in Segments(t) : s < OpenSegment(t) =>
+            /\ topicInfo[t].sealedCounts[s] = WalCount(t, s)
+            /\ topicInfo[t].segmentLeaders[s] \in Nodes
+```
+
+Entry counts for sealed segments match actual WAL contents and never change after sealing.
+
+### Read Cursor Bounds
+
+```tla
+InvReadCursorWithinBounds ==
+    \A t \in topics :
+        LET cur == readers[t] IN
+        LET seg == cur.segment IN
+        /\ seg <= OpenSegment(t)
+        /\ cur.delivered <=
+            IF seg < OpenSegment(t)
+                THEN topicInfo[t].sealedCounts[seg]
+                ELSE WalCount(t, seg)
+```
+
+Cursors never exceed segment boundaries or available entry counts, preventing out-of-bounds reads.
+
+### Sequential Write Order
+
+```tla
+InvSeqOrder ==
+    \A t \in topics :
+        \A s \in Segments(t) :
+            \A i \in 1 .. Len(wal[t][s]) : wal[t][s][i] = i
+```
+
+Entries within each segment maintain strict sequential ordering (1, 2, 3, ...).
+
+## Liveness Properties
+
+The specification verifies temporal properties ensuring the system makes progress:
+
+### Rollover Progress
+
+```tla
+RolloverProgress ==
+    [] ( \A t \in Topics :
+            \A s \in SegIds :
+                (t \in topics /\ s <= OpenSegmentSafe(t) 
+                 /\ WalCount(t, s) >= MaxSegmentEntries 
+                 /\ s + 1 \in SegIds)
+                => <> (OpenSegmentSafe(t) > s) )
+```
+
+<AccordionGroup>
+  <Accordion title="Interpretation">
+    If a segment reaches the maximum entry threshold and another segment ID is available, the system will **eventually** roll over to a new segment.
+    
+    This ensures the monitor loop's periodic checks will detect the threshold and trigger rollover via Raft consensus.
+  </Accordion>
+</AccordionGroup>
+
+### Read Progress
+
+```tla
+ReadProgress ==
+    [] ( \A t \in Topics :
+            IF t \in topics THEN
+                \A s \in SegIds :
+                    (ReaderSafe(t).segment = s 
+                     /\ ReaderSafe(t).delivered < WalCount(t, s))
+                    => <> CursorAdvances(t, s, ReaderSafe(t).delivered)
+            ELSE TRUE )
+```
+
+<AccordionGroup>
+  <Accordion title="Interpretation">
+    If unread entries are available in the current segment, the reader cursor will **eventually** advance to consume them.
+    
+    This guarantees that available data will not remain unread indefinitely under fair scheduling.
+  </Accordion>
+</AccordionGroup>
+
+## Model Checking Configuration
+
+The TLC model checker configuration (`DistributedWalrus.cfg`):
+
+```tla
+SPECIFICATION
+Spec
+
+INVARIANTS
+Invariants
+
+PROPERTY
+RolloverProgress
+ReadProgress
+
+CONSTANTS
+    Nodes = {1, 2, 3}
+    Topics = {"logs", "metrics"}
+    SegIds = {1, 2, 3}
+    MaxSegmentEntries = 2
+
+CHECK_DEADLOCK TRUE
+```
+
+### Running the Model Checker
+
+To verify the specification with TLC:
+
+```bash
+cd distributed-walrus/spec
+tlc DistributedWalrus.tla -config DistributedWalrus.cfg
+```
+
+<Note>
+The model uses small constants to keep the state space tractable. Larger values would explore more behaviors but require significantly more time and memory.
+</Note>
+
+## Abstraction Boundaries
+
+The specification intentionally abstracts certain implementation details:
+
+<CardGroup cols={2}>
+  <Card title="Raft Consensus" icon="users">
+    Modeled as a single authoritative metadata source rather than the full Raft protocol with leader election and log replication.
+  </Card>
+  <Card title="Network Communication" icon="network-wired">
+    Request forwarding and RPC calls are not explicitly modeled. The specification assumes reliable eventual delivery.
+  </Card>
+  <Card title="Storage Backend" icon="database">
+    Walrus engine abstracted as per-segment entry sequences. Actual WAL file format and I/O operations are not modeled.
+  </Card>
+  <Card title="Lease Synchronization" icon="clock">
+    The 100ms sync loop is not modeled. The specification assumes leases are always consistent with metadata.
+  </Card>
+</CardGroup>
+
+## Limitations
+
+The current specification does **not** model:
+
+- Node failures and recovery
+- Network partitions and message reordering
+- Concurrent readers with different cursors
+- Batch operations
+- Multi-topic interactions
+
+Future versions of the specification may incorporate these aspects for more comprehensive verification.
+
+## Relationship to Implementation
+
+The TLA+ spec validates the **design** of the distributed data plane. Implementation correctness requires:
+
+1. **Faithful translation**: Code must implement the modeled actions correctly
+2. **Proper synchronization**: Rust's type system and careful locking ensure thread safety
+3. **Integration testing**: The [test suite](/resources/contributing) validates end-to-end behavior
+
+<Tip>
+The specification serves as a blueprint for understanding system behavior and guides implementation decisions. When in doubt about edge cases, consult the TLA+ model.
+</Tip>
+
+## Further Reading
+
+- [TLA+ Homepage](https://lamport.azurewebsites.net/tla/tla.html) - Learn TLA+ specification language
+- [PlusCal Algorithm Language](https://lamport.azurewebsites.net/tla/pluscal.html) - Higher-level specification syntax
+- [Specifying Systems](https://lamport.azurewebsites.net/tla/book.html) - Comprehensive TLA+ textbook

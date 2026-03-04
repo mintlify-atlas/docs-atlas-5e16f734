@@ -1,0 +1,712 @@
+---
+title: Troubleshooting
+description: Diagnose and resolve common issues in Walrus distributed log streaming engine
+---
+
+This guide covers common issues, diagnostic steps, and solutions for operating Walrus in production.
+
+## Quick Diagnostics
+
+When encountering issues, start with these diagnostic commands:
+
+```bash
+# Check cluster health
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 metrics
+
+# Check topic state
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 state logs
+
+# Test write operation
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 put test "diagnostic write"
+
+# Test read operation
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 get test
+```
+
+## Common Issues
+
+### No Raft Leader Elected
+
+**Symptoms**:
+- `METRICS` shows `"current_leader": null`
+- All nodes report `state: "Candidate"` or `state: "Follower"`
+- Write operations fail with leader errors
+
+**Causes**:
+1. Less than quorum (< 50%) of nodes are running
+2. Network partition preventing consensus
+3. Clock skew between nodes
+4. Bootstrap node didn't initialize properly
+
+<Steps>
+  <Step title="Check node count">
+    ```bash
+    # Ensure at least 2 of 3 nodes are running (or 3 of 5)
+    ps aux | grep walrus
+    ```
+    
+    <Check>
+    For a 3-node cluster, at least 2 nodes must be running for quorum.
+    </Check>
+  </Step>
+  
+  <Step title="Check network connectivity">
+    ```bash
+    # From node 2, test connectivity to node 1
+    nc -zv 127.0.0.1 6001
+    
+    # Check if Raft ports are reachable
+    telnet node1-addr 6001
+    ```
+  </Step>
+  
+  <Step title="Check bootstrap status">
+    ```bash
+    # Node 1 should show as initial leader
+    curl http://127.0.0.1:9091/metrics | jq '.state'
+    ```
+    
+    If node 1 was not bootstrapped correctly, restart with proper flags:
+    
+    ```bash
+    cargo run -- --node-id 1 --raft-port 6001 --client-port 9091
+    # Do NOT use --join on the first node
+    ```
+  </Step>
+  
+  <Step title="Check clock synchronization">
+    ```bash
+    # Install and enable NTP
+    sudo systemctl status chronyd  # or ntpd
+    
+    # Check time on all nodes
+    date
+    ```
+    
+    <Warning>
+    Clock skew > 1 second can cause Raft consensus issues. Use NTP to synchronize clocks.
+    </Warning>
+  </Step>
+</Steps>
+
+**Solution**:
+```bash
+# If cluster is stuck, restart all nodes in order:
+
+# 1. Stop all nodes
+pkill walrus
+
+# 2. Start node 1 (bootstrap leader)
+cargo run -- --node-id 1 --raft-port 6001 --client-port 9091 &
+
+# 3. Wait 5 seconds for node 1 to initialize
+sleep 5
+
+# 4. Start node 2
+cargo run -- --node-id 2 --raft-port 6002 --client-port 9092 --join 127.0.0.1:6001 &
+
+# 5. Start node 3
+cargo run -- --node-id 3 --raft-port 6003 --client-port 9093 --join 127.0.0.1:6001 &
+```
+
+### Write Operations Failing
+
+**Symptoms**:
+- `PUT` commands return `ERR NotLeaderError`
+- `METRICS` shows leader elected but writes still fail
+
+**Causes**:
+1. Lease synchronization not complete
+2. Writing to a sealed segment
+3. Incorrect topic routing
+
+<AccordionGroup>
+  <Accordion title="Solution 1: Wait for Lease Sync">
+    Leases are synchronized every 100ms. Wait and retry:
+    
+    ```bash
+    # Wait 200ms and retry
+    sleep 0.2
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 put logs "test"
+    ```
+  </Accordion>
+  
+  <Accordion title="Solution 2: Check Topic State">
+    ```bash
+    # Verify topic metadata
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 state logs
+    ```
+    
+    Look for:
+    - `current_segment`: Active segment ID
+    - `leader_node`: Node responsible for writes
+    
+    If metadata is inconsistent, the cluster may need time to converge after a rollover.
+  </Accordion>
+  
+  <Accordion title="Solution 3: Connect to Leader">
+    ```bash
+    # Find the leader
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 metrics | jq '.current_leader'
+    
+    # Connect directly to leader's client port
+    # If leader is node 2 (port 9092)
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9092 put logs "test"
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Read Operations Return EMPTY
+
+**Symptoms**:
+- `GET` commands return `EMPTY` despite previous writes
+- Writes succeeded but reads find no data
+
+**Diagnostic**:
+```bash
+# Check if topic was created
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 state logs
+
+# Verify writes were successful
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 put logs "test write"
+# Should return: OK
+
+# Try reading again
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 get logs
+```
+
+**Causes & Solutions**:
+
+<Tabs>
+  <Tab title="Cursor Position">
+    **Cause**: Read cursor is at the end of available data
+    
+    **Check**:
+    ```bash
+    # Get topic state
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 state logs
+    ```
+    
+    If cursor has already consumed all entries, write new data:
+    ```bash
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 put logs "new entry"
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 get logs
+    ```
+  </Tab>
+  
+  <Tab title="Wrong Node">
+    **Cause**: Reading from a node that doesn't have the segment data
+    
+    **Solution**: Read from the segment leader node
+    ```bash
+    # Check segment leaders
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 state logs | jq '.segment_leaders'
+    
+    # Connect to the node that owns segment 1
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9092 get logs
+    ```
+  </Tab>
+  
+  <Tab title="Topic Doesn't Exist">
+    **Cause**: Topic was never created
+    
+    **Solution**: Register the topic first
+    ```bash
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 register logs
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 put logs "first entry"
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 get logs
+    ```
+  </Tab>
+</Tabs>
+
+### Follower Replication Lag
+
+**Symptoms**:
+- `METRICS` shows large gap between `match_index` and `last_log_index`
+- Follower consistently behind leader
+
+**Diagnostic**:
+```bash
+# Check replication status on leader
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 metrics | jq '.replication'
+
+# Example output showing lag:
+# "2": {
+#   "match_index": 100,    <- Follower at entry 100
+#   "next_index": 101
+# }
+# "last_log_index": 500    <- Leader at entry 500
+# LAG: 400 entries
+```
+
+**Causes & Solutions**:
+
+<AccordionGroup>
+  <Accordion title="Network Congestion">
+    **Check network latency**:
+    ```bash
+    # Measure RTT between nodes
+    ping -c 10 node2-addr
+    
+    # Check for packet loss
+    mtr node2-addr
+    ```
+    
+    **Solution**: 
+    - Improve network connectivity between nodes
+    - Use dedicated network for Raft traffic
+    - Consider using higher bandwidth links
+  </Accordion>
+  
+  <Accordion title="Follower Overloaded">
+    **Check CPU and disk I/O**:
+    ```bash
+    # On the lagging follower
+    top -n 1
+    iostat -x 1 5
+    ```
+    
+    **Solution**:
+    - Reduce load on follower node
+    - Add more nodes to distribute load
+    - Upgrade hardware (faster disks, more CPU)
+  </Accordion>
+  
+  <Accordion title="Large Metadata Operations">
+    **Cause**: Large snapshots or batch metadata changes
+    
+    **Solution**: Wait for replication to catch up
+    ```bash
+    # Monitor replication progress
+    watch -n 1 'cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 metrics | jq ".replication"'
+    ```
+    
+    <Note>
+    Large lags (>1000 entries) may take several minutes to resolve. This is normal after cluster restarts or large metadata changes.
+    </Note>
+  </Accordion>
+</AccordionGroup>
+
+### Segment Rollover Not Happening
+
+**Symptoms**:
+- Segment has exceeded `WALRUS_MAX_SEGMENT_ENTRIES` but no rollover
+- `STATE` shows current segment with very high entry count
+
+**Diagnostic**:
+```bash
+# Check if monitor is running
+ps aux | grep walrus
+# Look for "Monitor loop started" in logs
+
+# Check current segment size
+cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 state logs | jq '.current_segment'
+
+# Check environment variable
+echo $WALRUS_MAX_SEGMENT_ENTRIES
+```
+
+**Causes & Solutions**:
+
+<Steps>
+  <Step title="Monitor Loop Not Running">
+    **Check logs** for "Monitor loop started":
+    ```bash
+    tail -f /var/log/walrus/node-1.log | grep "Monitor"
+    ```
+    
+    If missing, the monitor task may have panicked. Restart the node.
+  </Step>
+  
+  <Step title="Wrong Node Checking">
+    Only the **current segment leader** triggers rollover. Verify leadership:
+    ```bash
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 state logs | jq '.leader_node'
+    ```
+    
+    Check the leader node's logs for rollover attempts.
+  </Step>
+  
+  <Step title="Raft Consensus Failure">
+    Rollover requires Raft consensus. Check if proposals are failing:
+    ```bash
+    # Look for Raft errors in logs
+    tail -f /var/log/walrus/node-1.log | grep -i "raft.*error"
+    ```
+    
+    If Raft is unhealthy, resolve Raft issues first (see "No Raft Leader" section).
+  </Step>
+  
+  <Step title="Force Rollover Test">
+    Lower the threshold temporarily to test rollover:
+    ```bash
+    # Set very low threshold
+    export WALRUS_MAX_SEGMENT_ENTRIES=10
+    
+    # Restart the leader node
+    # Write 20 entries and verify rollover happens
+    ```
+  </Step>
+</Steps>
+
+### Disk Space Issues
+
+**Symptoms**:
+- Writes start failing
+- "No space left on device" errors
+- WAL files consuming excessive disk space
+
+**Check disk usage**:
+```bash
+# Check overall disk usage
+df -h /path/to/data
+
+# Check per-node usage
+du -sh /path/to/data/node_*
+
+# List largest WAL files
+find /path/to/data -type f -name "[0-9]*" -exec ls -lh {} \; | sort -k5 -hr | head -20
+```
+
+**Solutions**:
+
+<Tabs>
+  <Tab title="Implement Retention">
+    <Warning>
+    Walrus currently has **no automatic retention**. You must manually delete old segments.
+    </Warning>
+    
+    ```bash
+    # Identify old sealed segments
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 state logs | jq '.sealed_segments'
+    
+    # Manually remove old segment files (be careful!)
+    # Only delete files for segments you no longer need
+    
+    # Find segment files by timestamp
+    ls -lt /path/to/data/node_1/user_data/data_plane/
+    ```
+    
+    <Note>
+    Future versions will include automatic retention policies. For now, implement external cleanup scripts.
+    </Note>
+  </Tab>
+  
+  <Tab title="Add More Disk Space">
+    ```bash
+    # Resize partition
+    sudo resize2fs /dev/sdb
+    
+    # Or mount additional volume
+    sudo mkdir /data2
+    sudo mount /dev/sdc /data2
+    
+    # Restart Walrus with new data directory
+    cargo run -- --node-id 1 --data-dir /data2
+    ```
+  </Tab>
+  
+  <Tab title="Increase Segment Size">
+    Fewer, larger segments can be more space-efficient:
+    
+    ```bash
+    export WALRUS_MAX_SEGMENT_ENTRIES=5000000  # 5M entries per segment
+    
+    # Restart nodes with new configuration
+    ```
+    
+    This reduces metadata overhead and file count.
+  </Tab>
+</Tabs>
+
+### io_uring Errors
+
+**Symptoms**:
+- Batch operations failing with "Unsupported" errors
+- Lower than expected throughput
+- Errors mentioning "io_uring"
+
+**Check io_uring support**:
+```bash
+# Check kernel version (need 5.1+)
+uname -r
+
+# Check if liburing is installed
+ldconfig -p | grep liburing
+
+# Check system limits
+cat /proc/sys/fs/aio-max-nr
+```
+
+**Solutions**:
+
+<AccordionGroup>
+  <Accordion title="Kernel Too Old">
+    **Upgrade kernel** to 5.6 or later:
+    
+    ```bash
+    # On Ubuntu/Debian
+    sudo apt-get update
+    sudo apt-get install linux-generic-hwe-$(lsb_release -rs)
+    
+    # Reboot into new kernel
+    sudo reboot
+    ```
+    
+    <Note>
+    io_uring is stable in Linux 5.6+. Earlier versions (5.1-5.5) have limited support.
+    </Note>
+  </Accordion>
+  
+  <Accordion title="Missing liburing">
+    **Install liburing**:
+    
+    ```bash
+    # On Ubuntu/Debian
+    sudo apt-get install liburing-dev
+    
+    # On RHEL/CentOS
+    sudo yum install liburing-devel
+    
+    # Rebuild Walrus
+    cargo build --release
+    ```
+  </Accordion>
+  
+  <Accordion title="Fall Back to mmap">
+    If io_uring is not available, disable the FD backend:
+    
+    ```bash
+    export WALRUS_DISABLE_IO_URING=1
+    
+    # Or in code
+    use walrus_rust::disable_fd_backend;
+    disable_fd_backend();
+    ```
+    
+    <Warning>
+    This will reduce batch operation throughput by 3-10x.
+    </Warning>
+  </Accordion>
+</AccordionGroup>
+
+### High CPU Usage
+
+**Symptoms**:
+- Walrus processes consuming >80% CPU
+- System slow or unresponsive
+
+**Diagnostic**:
+```bash
+# Check CPU usage
+top -H -p $(pgrep walrus)
+
+# Profile with perf
+sudo perf top -p $(pgrep walrus)
+```
+
+**Common Causes**:
+
+<Tabs>
+  <Tab title="Tight Loops">
+    **Monitor loop too frequent**:
+    ```bash
+    echo $WALRUS_MONITOR_CHECK_MS
+    # If very low (<1000), increase it
+    export WALRUS_MONITOR_CHECK_MS=10000
+    ```
+  </Tab>
+  
+  <Tab title="Excessive Logging">
+    **Too much debug output**:
+    ```bash
+    # Reduce log level
+    export RUST_LOG=info  # Instead of debug
+    
+    # Or suppress debug prints
+    export WALRUS_QUIET=1
+    ```
+  </Tab>
+  
+  <Tab title="Raft Election Storm">
+    **Frequent leader elections**:
+    ```bash
+    # Check term changes
+    watch -n 1 'cargo run --bin walrus-cli -- --addr 127.0.0.1:9091 metrics | jq ".current_term"'
+    ```
+    
+    If term is increasing rapidly, you have network issues causing split-brain.
+    
+    **Solution**: Fix network connectivity between nodes.
+  </Tab>
+  
+  <Tab title="Heavy Write Load">
+    **High write throughput** is expected to use CPU. This is normal.
+    
+    **Optimize**:
+    - Use batch operations instead of single writes
+    - Increase `FsyncSchedule` interval
+    - Scale horizontally (add more nodes)
+  </Tab>
+</Tabs>
+
+## Performance Issues
+
+### Low Write Throughput
+
+**Expected**: 100k-1M writes/sec without fsync, 5k-10k writes/sec with fsync
+
+**If below expected**:
+
+<Steps>
+  <Step title="Verify io_uring is enabled">
+    ```bash
+    # Should NOT be set
+    echo $WALRUS_DISABLE_IO_URING
+    
+    # Check logs for io_uring usage
+    tail -f /var/log/walrus/node-1.log | grep -i "uring"
+    ```
+  </Step>
+  
+  <Step title="Use batch operations">
+    ```rust
+    // BAD: Single writes in a loop
+    for entry in entries {
+        wal.append_for_topic("logs", entry)?;
+    }
+    
+    // GOOD: Batch write
+    wal.batch_append_for_topic("logs", &entries)?;
+    ```
+  </Step>
+  
+  <Step title="Reduce fsync frequency">
+    ```bash
+    # Current configuration
+    cargo run -- --node-id 1 ...
+    
+    # With less frequent fsync
+    # (configure in code via FsyncSchedule)
+    ```
+  </Step>
+  
+  <Step title="Check disk performance">
+    ```bash
+    # Test disk write speed
+    dd if=/dev/zero of=/path/to/data/test bs=1M count=1000 conv=fdatasync
+    
+    # Should see >500 MB/s on SSD
+    ```
+    
+    If disk is slow, consider:
+    - Using NVMe SSD instead of SATA SSD
+    - Checking I/O scheduler configuration
+    - Ensuring no competing I/O workloads
+  </Step>
+</Steps>
+
+### High Read Latency
+
+**Expected**: &lt;1ms per read on SSD, &lt;10ms for batch reads
+
+**If higher**:
+
+1. **Check if reading from wrong node**: Sealed segments are only on their original leader
+2. **Use batch reads**: More efficient than single reads
+3. **Check disk read performance**: Use `iostat -x 1` to monitor disk utilization
+
+## Data Integrity Issues
+
+### Checksum Errors
+
+**Symptoms**:
+- `InvalidData` errors when reading
+- "Checksum mismatch" in logs
+
+**Causes**:
+- Disk corruption
+- Incomplete writes (power failure without fsync)
+- Bug in Walrus storage layer
+
+**Recovery**:
+```bash
+# Identify corrupted segment
+# Check logs for file path and offset
+
+# Option 1: Delete corrupted segment (data loss)
+rm /path/to/corrupted/segment/file
+
+# Option 2: Restore from backup
+cp /backup/segment/file /path/to/data/
+
+# Option 3: Replicate from another node
+# Copy segment files from a healthy node
+```
+
+<Warning>
+Always use `FsyncSchedule::SyncEach` or frequent fsync for critical data to prevent corruption on power failure.
+</Warning>
+
+## Cluster State Issues
+
+### Split Brain
+
+**Symptoms**:
+- Multiple nodes claim to be leader
+- Writes succeed on multiple nodes for same segment
+- Inconsistent data across nodes
+
+<Warning>
+Split brain is a critical issue that can cause data inconsistency. **Immediate action required**.
+</Warning>
+
+**Diagnostic**:
+```bash
+# Check leader on all nodes
+for port in 9091 9092 9093; do
+  echo "Node on port $port:"
+  cargo run --bin walrus-cli -- --addr 127.0.0.1:$port metrics | jq '{id, state, current_leader}'
+done
+```
+
+**Recovery**:
+1. **Stop all nodes immediately**
+2. **Backup data directories**
+3. **Identify the true leader** (highest term, most recent data)
+4. **Restart cluster** from scratch using bootstrap node
+
+## Getting Help
+
+If you've exhausted these troubleshooting steps:
+
+<CardGroup cols={2}>
+  <Card title="GitHub Issues" icon="github" href="https://github.com/nubskr/walrus/issues">
+    Report bugs and request features
+  </Card>
+  <Card title="Discussions" icon="comments" href="https://github.com/nubskr/walrus/discussions">
+    Ask questions and share solutions
+  </Card>
+</CardGroup>
+
+### Information to Include
+
+When reporting issues, provide:
+
+1. **Walrus version**: `cargo --version` and git commit hash
+2. **Cluster configuration**: Number of nodes, hardware specs
+3. **Environment variables**: Output of `env | grep WALRUS`
+4. **Metrics output**: `METRICS` and `STATE` commands
+5. **Logs**: Relevant error messages with context
+6. **Reproduction steps**: How to reproduce the issue
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Configuration" icon="gear" href="/operations/configuration">
+    Review configuration options
+  </Card>
+  <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+    Set up monitoring and alerting
+  </Card>
+</CardGroup>

@@ -1,97 +1,174 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Walrus Documentation"
+description: "Distributed log streaming engine built from first principles"
+mode: "custom"
 ---
 
-## Setting up
+<div className="relative overflow-hidden bg-gradient-to-br from-gray-900 via-gray-800 to-black dark:from-[#0a0a0a] dark:via-[#0f0f0f] dark:to-[#050505] py-20">
+  <div className="max-w-7xl mx-auto px-6 lg:px-8">
+    <div className="grid lg:grid-cols-12 gap-12 items-center">
+      <div className="lg:col-span-7">
+        <h1 className="text-5xl lg:text-6xl font-bold text-white mb-6">
+          Distributed Log Streaming Engine
+        </h1>
+        <p className="text-xl text-gray-300 dark:text-gray-400 max-w-2xl mb-8">
+          Build fault-tolerant streaming systems with automatic load balancing, Raft consensus, and high-performance storage built from first principles.
+        </p>
+        <div className="flex flex-wrap gap-4">
+          <a 
+            href="/quickstart" 
+            className="inline-flex items-center px-6 py-3 rounded-lg bg-[#040404] hover:bg-[#1a1a1a] text-white font-semibold transition-colors no-underline"
+          >
+            Get Started
+            <svg className="ml-2 w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+            </svg>
+          </a>
+          <a 
+            href="/concepts/architecture" 
+            className="inline-flex items-center px-6 py-3 rounded-lg border border-gray-600 dark:border-gray-700 bg-transparent hover:bg-white/10 dark:hover:bg-white/5 text-white font-semibold transition-colors no-underline"
+          >
+            Learn Architecture
+          </a>
+        </div>
+      </div>
+      <div className="lg:col-span-5 hidden lg:block">
+        <div className="relative">
+          <img 
+            src="https://raw.githubusercontent.com/nubskr/walrus/main/figures/walrus1.png" 
+            alt="Walrus mascot" 
+            noZoom
+            className="w-full h-auto max-w-md mx-auto"
+          />
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
-Get your documentation site up and running in minutes.
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Quick Start</h2>
+  <p className="text-lg text-gray-600 dark:text-gray-400 mb-8">Get Walrus running in minutes</p>
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+  <Steps>
+    <Step title="Install from crates.io">
+      Add Walrus to your Rust project:
+      
+      ```toml Cargo.toml
+      [dependencies]
+      walrus-rust = "0.2.0"
+      ```
+    </Step>
+    
+    <Step title="Create a WAL instance">
+      Initialize Walrus and write your first entry:
+      
+      ```rust
+      use walrus_rust::Walrus;
 
-## Make it yours
+      let wal = Walrus::new()?;
+      wal.append_for_topic("my-topic", b"Hello, Walrus!")?;
+      ```
+    </Step>
+    
+    <Step title="Read from the log">
+      Consume entries from your topic:
+      
+      ```rust
+      if let Some(entry) = wal.read_next("my-topic", true)? {
+          println!("Read: {:?}", String::from_utf8_lossy(&entry.data));
+      }
+      ```
+    </Step>
+  </Steps>
+</div>
 
-Design a docs site that looks great and empowers your users.
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Key Features</h2>
+  <p className="text-lg text-gray-600 dark:text-gray-400 mb-8">What makes Walrus different</p>
 
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
-  </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
-  </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
-  </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
-  </Card>
-</Columns>
+  <CardGroup cols={2}>
+    <Card title="Automatic Load Balancing" icon="scale-balanced" href="/cluster/segment-management">
+      Segment-based leadership rotation distributes load across cluster nodes automatically
+    </Card>
+    <Card title="Raft Consensus" icon="network-wired" href="/concepts/raft-consensus">
+      Fault-tolerant metadata coordination ensures consistency across distributed nodes
+    </Card>
+    <Card title="High Performance" icon="bolt" href="/resources/benchmarks">
+      io_uring on Linux delivers over 1M writes/sec with batch operations
+    </Card>
+    <Card title="Write Fencing" icon="shield-halved" href="/cluster/segment-management">
+      Lease-based write fencing prevents split-brain during leadership changes
+    </Card>
+    <Card title="Batch Operations" icon="layer-group" href="/library/batch-operations">
+      Atomic batch writes and reads with guaranteed all-or-nothing semantics
+    </Card>
+    <Card title="Flexible Consistency" icon="sliders" href="/concepts/consistency-models">
+      Choose between strict and relaxed consistency models for your use case
+    </Card>
+  </CardGroup>
+</div>
 
-## Create beautiful pages
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Explore by Topic</h2>
+  <p className="text-lg text-gray-600 dark:text-gray-400 mb-8">Choose your path through the documentation</p>
 
-Everything you need to create world-class documentation.
+  <CardGroup cols={3}>
+    <Card title="Core Concepts" icon="book-open" href="/concepts/architecture">
+      Understand Walrus architecture, topics, segments, and consensus
+    </Card>
+    <Card title="Standalone Library" icon="cube" href="/library/overview">
+      Use Walrus as an embedded storage engine in your application
+    </Card>
+    <Card title="Distributed Cluster" icon="server" href="/cluster/overview">
+      Deploy a fault-tolerant streaming cluster with Raft consensus
+    </Card>
+    <Card title="Operations Guide" icon="gears" href="/operations/configuration">
+      Configure, monitor, and tune your Walrus deployment
+    </Card>
+    <Card title="API Reference" icon="code" href="/api/walrus">
+      Browse the complete library, CLI, and cluster API documentation
+    </Card>
+    <Card title="Benchmarks" icon="chart-line" href="/resources/benchmarks">
+      See performance comparisons with Kafka and RocksDB
+    </Card>
+  </CardGroup>
+</div>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Resources</h2>
+  <p className="text-lg text-gray-600 dark:text-gray-400 mb-8">Additional materials and community</p>
 
-## Need inspiration?
+  <CardGroup cols={2}>
+    <Card title="Formal Verification" icon="check-double" href="/resources/correctness">
+      TLA+ specification with verified invariants and liveness properties
+    </Card>
+    <Card title="Contributing Guide" icon="code-pull-request" href="/resources/contributing">
+      Learn how to contribute patches and improvements to Walrus
+    </Card>
+    <Card title="Changelog" icon="clock-rotate-left" href="/resources/changelog">
+      Track new features, improvements, and fixes across versions
+    </Card>
+    <Card title="GitHub Repository" icon="github" href="https://github.com/nubskr/walrus">
+      Browse source code, open issues, and star the project
+    </Card>
+  </CardGroup>
+</div>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<div className="mt-20 mb-16 max-w-5xl mx-auto px-6">
+  <div className="rounded-2xl border border-gray-200 dark:border-[#27272a] bg-gray-50 dark:bg-[#1a1d27] p-8 lg:p-12">
+    <h2 className="text-3xl font-bold text-gray-900 dark:text-white mb-4">Ready to get started?</h2>
+    <p className="text-lg text-gray-600 dark:text-gray-400 mb-6 max-w-2xl">
+      Follow our quickstart guide to build your first streaming application with Walrus in minutes.
+    </p>
+    <a 
+      href="/quickstart" 
+      className="inline-flex items-center px-6 py-3 rounded-lg bg-[#040404] hover:bg-[#1a1a1a] text-white font-semibold transition-colors no-underline"
+    >
+      Start Building
+      <svg className="ml-2 w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
+      </svg>
+    </a>
+  </div>
+</div>

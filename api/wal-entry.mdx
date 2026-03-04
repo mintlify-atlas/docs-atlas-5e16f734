@@ -1,0 +1,287 @@
+---
+title: "Entry (WalEntry)"
+description: "Data structure returned by WAL read operations"
+---
+
+The `Entry` struct represents a single log entry read from the Write-Ahead Log. It is returned by all read operations and contains the raw byte data that was written.
+
+## Struct Definition
+
+```rust
+pub struct Entry {
+    pub data: Vec<u8>,
+}
+```
+
+## Fields
+
+### data
+
+The raw byte data stored in this WAL entry.
+
+<ParamField path="data" type="Vec<u8>">
+  Vector of bytes containing the entry payload. This is the exact data that was passed to `append_for_topic()` or `batch_append_for_topic()`.
+</ParamField>
+
+**Characteristics:**
+- Owned data (not a reference)
+- Arbitrary byte sequence
+- No built-in serialization format
+- Length can be 0 to ~10MB per entry
+
+## Usage
+
+### Reading Entries
+
+The `Entry` struct is returned by read operations:
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+
+// Write some data
+wal.append_for_topic("my-topic", b"Hello, Walrus!")?;
+
+// Read it back
+if let Some(entry) = wal.read_next("my-topic", true)? {
+    // Access the raw bytes
+    println!("Entry data: {:?}", entry.data);
+    
+    // Convert to string
+    let text = String::from_utf8_lossy(&entry.data);
+    println!("As text: {}", text);
+}
+```
+
+### Batch Reading
+
+Batch operations return `Vec<Entry>`:
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+
+// Write multiple entries
+wal.batch_append_for_topic("events", &[
+    b"event 1",
+    b"event 2",
+    b"event 3",
+])?;
+
+// Read them back in a batch
+let entries = wal.batch_read_for_topic("events", 1024 * 1024, true, None)?;
+for entry in entries {
+    println!("Entry size: {} bytes", entry.data.len());
+}
+```
+
+## Data Integrity
+
+Every `Entry` returned by read operations has been verified for integrity:
+
+- **Checksum validation**: Data is verified against a stored 64-bit FNV-1a checksum
+- **Metadata validation**: Entry headers are validated before data extraction
+- **Corruption detection**: Corrupted entries are detected and errors are returned
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+
+match wal.read_next("topic", true) {
+    Ok(Some(entry)) => {
+        // Data has been checksum-verified and is guaranteed intact
+        process_data(&entry.data);
+    }
+    Ok(None) => {
+        // No more entries
+    }
+    Err(e) => {
+        // I/O error or data corruption detected
+        eprintln!("Read error: {}", e);
+    }
+}
+```
+
+## Working with Entry Data
+
+### String Data
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+
+// Write string
+let message = "Hello, World!";
+wal.append_for_topic("messages", message.as_bytes())?;
+
+// Read string
+if let Some(entry) = wal.read_next("messages", true)? {
+    let text = String::from_utf8_lossy(&entry.data);
+    println!("Message: {}", text);
+}
+```
+
+### JSON Data
+
+```rust
+use walrus_rust::Walrus;
+use serde_json::json;
+
+let wal = Walrus::new()?;
+
+// Write JSON
+let data = json!({
+    "user_id": 123,
+    "action": "login"
+});
+wal.append_for_topic("events", data.to_string().as_bytes())?;
+
+// Read JSON
+if let Some(entry) = wal.read_next("events", true)? {
+    let value: serde_json::Value = serde_json::from_slice(&entry.data)?;
+    println!("Event: {:?}", value);
+}
+```
+
+### Binary Data (Protobuf, etc.)
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+
+// Write binary protocol buffer
+let proto_bytes: Vec<u8> = serialize_protobuf(&my_message);
+wal.append_for_topic("protos", &proto_bytes)?;
+
+// Read binary protocol buffer
+if let Some(entry) = wal.read_next("protos", true)? {
+    let message = deserialize_protobuf(&entry.data)?;
+    process_message(message);
+}
+```
+
+### Custom Serialization
+
+```rust
+use walrus_rust::Walrus;
+use bincode;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+struct MyStruct {
+    id: u64,
+    name: String,
+}
+
+let wal = Walrus::new()?;
+
+// Write with bincode
+let data = MyStruct { id: 42, name: "example".into() };
+let bytes = bincode::serialize(&data)?;
+wal.append_for_topic("structs", &bytes)?;
+
+// Read with bincode
+if let Some(entry) = wal.read_next("structs", true)? {
+    let decoded: MyStruct = bincode::deserialize(&entry.data)?;
+    println!("ID: {}, Name: {}", decoded.id, decoded.name);
+}
+```
+
+## Memory Considerations
+
+### Entry Ownership
+
+Each `Entry` owns its data, so reading entries allocates memory:
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+
+// Each entry allocates a new Vec<u8>
+for _ in 0..1000 {
+    if let Some(entry) = wal.read_next("topic", true)? {
+        // entry.data is heap-allocated
+        process(entry);
+        // entry.data is freed here when entry goes out of scope
+    }
+}
+```
+
+### Batch Memory Usage
+
+Batch operations return all entries in memory:
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+
+// This could allocate significant memory if many entries fit in max_bytes
+let entries = wal.batch_read_for_topic("topic", 100 * 1024 * 1024, true, None)?;
+
+// Total memory: sum of all entry.data.len() + Vec overhead
+println!("Read {} entries", entries.len());
+```
+
+**Recommendation:** Use reasonable `max_bytes` limits to control memory usage in batch reads.
+
+## Entry Size Limits
+
+### Write Limits
+
+- **Single entry**: Up to ~10MB (limited by block size)
+- **Batch total**: Up to ~10GB across all entries
+- **Batch count**: Up to 2,000 entries per batch
+
+### Read Behavior
+
+- **read_next()**: Returns one entry at a time
+- **batch_read_for_topic()**: Returns entries up to `max_bytes` payload (always ≥ 1 entry if available)
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+
+// Write large entry (up to ~10MB)
+let large_data = vec![0u8; 5 * 1024 * 1024]; // 5MB
+wal.append_for_topic("large", &large_data)?;
+
+// Read large entry
+if let Some(entry) = wal.read_next("large", true)? {
+    println!("Large entry: {} bytes", entry.data.len());
+}
+```
+
+## Clone and Move Semantics
+
+```rust
+use walrus_rust::Walrus;
+
+let wal = Walrus::new()?;
+
+if let Some(entry) = wal.read_next("topic", true)? {
+    // Move entry
+    let data = entry.data; // entry is now unusable
+    process_owned(data);
+    
+    // Or clone data
+    if let Some(entry) = wal.read_next("topic", true)? {
+        let data_copy = entry.data.clone();
+        process_borrowed(&entry.data);
+        process_owned(data_copy);
+    }
+}
+```
+
+## Related Types
+
+- [Walrus](/api/walrus) - Main WAL instance providing read operations
+- [ReadConsistency](/api/read-consistency) - Controls when read positions are persisted
+- [FsyncSchedule](/api/fsync-schedule) - Controls when writes are flushed to disk

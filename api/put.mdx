@@ -1,0 +1,239 @@
+---
+title: PUT Command
+description: Append data to a topic in the distributed Walrus cluster
+---
+
+The `PUT` command appends a message to a topic's write-ahead log. The operation is automatically routed to the current segment leader.
+
+## Syntax
+
+```
+PUT <topic> <payload>
+```
+
+<ParamField path="topic" type="string" required>
+  The name of the topic to append to. Must be a single word (no spaces).
+</ParamField>
+
+<ParamField path="payload" type="string" required>
+  The data to append. Everything after the topic name (including spaces) is treated as the payload.
+</ParamField>
+
+## Wire Format
+
+**Request:**
+```
+[4 bytes: length] PUT <topic> <payload>
+```
+
+**Success Response:**
+```
+[4 bytes: 2] OK
+```
+
+**Error Response:**
+```
+[4 bytes: length] ERR <error message>
+```
+
+## Behavior
+
+### Write Path
+
+1. Client sends PUT to any node in the cluster
+2. Node looks up the current segment leader for the topic
+3. If not the leader, request is forwarded via RPC
+4. Leader checks its write lease (synced from Raft metadata)
+5. If lease is valid, data is appended to the Walrus WAL
+6. Response is returned to the client
+
+### Lease-Based Write Fencing
+
+- Only the segment leader can accept writes
+- Leases are derived from Raft-replicated metadata
+- Lease sync happens every 100ms
+- Non-leaders return `ERR NotLeaderError` if they receive a write
+- Prevents split-brain writes during leadership changes
+
+### Segment Rollover
+
+When a segment reaches ~1M entries (default):
+1. Monitor detects the threshold
+2. Segment is sealed via Raft consensus
+3. New segment is created with a new leader (round-robin)
+4. Subsequent PUTs are routed to the new segment leader
+5. Old segment remains readable from the original leader
+
+## Examples
+
+### Interactive Shell
+
+```bash
+🦭 > REGISTER logs
+OK
+
+🦭 > PUT logs hello world
+OK
+
+🦭 > PUT logs {"event":"user.login","user_id":123}
+OK
+
+🦭 > PUT logs multi word payload with spaces
+OK
+```
+
+### One-off Command
+
+```bash
+# Simple message
+cargo run --bin walrus-cli -- put logs "hello world"
+
+# JSON payload
+cargo run --bin walrus-cli -- put events '{"type":"click","timestamp":1234567890}'
+
+# Multi-line payload (quote in shell)
+cargo run --bin walrus-cli -- put logs "line 1
+line 2
+line 3"
+```
+
+### Programmatic Usage (Rust)
+
+```rust
+use distributed_walrus::cli_client::CliClient;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let client = CliClient::new("127.0.0.1:9091");
+    
+    // Register topic first
+    client.register("logs").await?;
+    
+    // Append messages
+    client.put("logs", "hello world").await?;
+    client.put("logs", "{\"event\":\"test\"}").await?;
+    
+    Ok(())
+}
+```
+
+### Batch Writes
+
+```bash
+# Write multiple entries in a loop
+for i in {1..100}; do
+    cargo run --bin walrus-cli -- put logs "message $i"
+done
+```
+
+## Error Cases
+
+### Missing Topic Name
+
+**Request:**
+```
+PUT
+```
+
+**Response:**
+```
+ERR PUT requires a topic
+```
+
+### Missing Payload
+
+**Request:**
+```
+PUT logs
+```
+
+**Response:**
+```
+ERR PUT requires a payload
+```
+
+### Topic Does Not Exist
+
+If you PUT to an unregistered topic:
+
+**Request:**
+```
+PUT nonexistent hello
+```
+
+**Response:**
+```
+ERR topic not found
+```
+
+Always REGISTER the topic first.
+
+### Write to Non-Leader
+
+Internal error (automatically handled by forwarding):
+```
+ERR NotLeaderError
+```
+
+The client connection node will forward to the correct leader.
+
+### Lease Expired
+
+During leadership transition:
+```
+ERR write lease expired
+```
+
+Retry the operation - the new leader will handle it.
+
+## Performance Considerations
+
+### Throughput
+
+- **Single writer per segment**: Lease-based fencing ensures one leader
+- **Latency**: ~1-2 RTT for forwarded operations + storage latency
+- **No data replication**: Only metadata goes through Raft
+- **Segment rollover**: Automatic load distribution across nodes
+
+### Payload Size
+
+- Maximum frame size: 64 KB
+- Larger payloads require splitting across multiple PUT operations
+- No built-in compression (handle at application layer)
+
+### Ordering Guarantees
+
+- **Per-topic ordering**: Guaranteed within a topic
+- **Cross-topic ordering**: Not guaranteed
+- **Offset assignment**: Monotonically increasing per topic
+
+## Cluster Behavior
+
+### Automatic Forwarding
+
+```
+Client → Node 2 (non-leader)
+           ↓ lookup "logs" leader
+           ↓ found: Node 1
+           ↓ forward via RPC
+        Node 1 (leader)
+           ↓ lease valid?
+           ↓ yes → append to Walrus
+           ↓ return OK
+        Node 2
+           ↓ return OK to client
+       Client
+```
+
+### Leadership Changes
+
+- Transparent to clients during normal rollover
+- Transient errors during failover (retry)
+- New leader elected via Raft consensus
+- Old segments remain readable from original leader
+
+## Related Commands
+
+- [REGISTER](/api/register) - Create a topic before writing
+- [GET](/api/get) - Read written data
+- [STATE](/api/state) - View segment and leader information

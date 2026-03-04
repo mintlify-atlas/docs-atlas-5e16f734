@@ -1,0 +1,436 @@
+---
+title: Consistency Models
+description: ReadConsistency options and FsyncSchedule configuration for tuning durability vs performance in Walrus
+---
+
+Walrus provides configurable consistency models and fsync scheduling to let you tune the trade-off between **durability** and **performance** based on your application's requirements.
+
+## ReadConsistency
+
+The `ReadConsistency` enum controls how read cursors are persisted to disk, affecting exactly-once vs at-least-once delivery semantics.
+
+### StrictlyAtOnce
+
+Guarantees **exactly-once consumption**: every read cursor update is immediately persisted to disk before returning.
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency};
+
+let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce)?;
+```
+
+**Behavior:**
+- Read cursor persisted after **every** `read_next()` call
+- Survivors process crashes with no message replays
+- Holds reader lock through IO for single-consumption semantics
+- Highest durability, lower read throughput
+
+**Use Cases:**
+- Financial transactions
+- Order processing
+- Any system requiring exactly-once delivery
+- Critical audit logs
+
+**Example:**
+```rust
+// Every read is persisted immediately
+let entry1 = wal.read_next("orders", true)?;  // Cursor persisted
+let entry2 = wal.read_next("orders", true)?;  // Cursor persisted
+let entry3 = wal.read_next("orders", true)?;  // Cursor persisted
+
+// After crash: Resumes from entry4 (no replays)
+```
+
+### AtLeastOnce
+
+Provides **at-least-once delivery**: read cursors are persisted periodically every N reads, allowing replays after crashes.
+
+```rust
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 }
+)?;
+```
+
+**Parameters:**
+- `persist_every`: Number of reads between cursor persistence (e.g., 1000)
+
+**Behavior:**
+- Read cursor persisted every N reads
+- After crash: May replay up to N messages
+- Releases reader lock before IO (allows concurrent readers)
+- Higher throughput, relaxed durability
+
+**Use Cases:**
+- Event processing (idempotent handlers)
+- Metrics aggregation
+- Log analysis
+- Any system tolerating replays
+
+**Example:**
+```rust
+// Cursor persisted every 1000 reads
+let wal = Walrus::with_consistency(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 }
+)?;
+
+for i in 0..2500 {
+    let entry = wal.read_next("logs", true)?;
+    // Cursor persisted at: 1000, 2000 (not yet at 2500)
+}
+
+// Crash here: Will replay last 500 messages (2000-2500)
+```
+
+### Comparison
+
+| Feature | StrictlyAtOnce | AtLeastOnce |
+|---------|---------------|-------------|
+| **Delivery** | Exactly-once | At-least-once |
+| **Cursor Persistence** | Every read | Every N reads |
+| **Crash Replays** | None | Up to N messages |
+| **Read Throughput** | Lower | Higher |
+| **Concurrency** | Serialized reads | Concurrent reads |
+| **Use Case** | Critical data | High throughput |
+
+<Info>
+The `checkpoint` parameter in `read_next(topic, checkpoint)` controls whether the cursor advances. Set to `false` for non-destructive peeks (no cursor update), or `true` to consume the entry.
+</Info>
+
+## FsyncSchedule
+
+The `FsyncSchedule` enum controls when write data is flushed to disk, affecting durability guarantees and write performance.
+
+### Milliseconds(u64)
+
+Flush data to disk at regular intervals (default: 200ms).
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::Milliseconds(500)  // Fsync every 500ms
+)?;
+```
+
+**Behavior:**
+- Background thread calls `fsync()` every N milliseconds
+- Buffered writes are flushed in batches
+- Balances durability and throughput
+- Default: 200ms
+
+**Data Loss Window:**
+- Crash before fsync: Lose writes from last N milliseconds
+- Example with 500ms: Lose up to 500ms of writes
+
+**Use Cases:**
+- General-purpose streaming
+- Most production workloads
+- Default recommended setting
+
+**Tuning:**
+```rust
+// More frequent fsyncs (better durability, lower throughput)
+FsyncSchedule::Milliseconds(100)   // Every 100ms
+
+// Less frequent fsyncs (higher throughput, larger loss window)
+FsyncSchedule::Milliseconds(1000)  // Every 1s
+
+// Default balanced setting
+FsyncSchedule::Milliseconds(200)   // Every 200ms
+```
+
+### SyncEach
+
+Flush data to disk after **every single write** (maximum durability).
+
+```rust
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,
+    FsyncSchedule::SyncEach
+)?;
+```
+
+**Behavior:**
+- Files opened with `O_SYNC` flag (on Unix systems)
+- Every `append_for_topic()` call waits for disk write
+- Guarantees data on disk before returning
+- Significantly lower write throughput
+
+**Data Loss Window:**
+- None (zero data loss on crash)
+
+**Use Cases:**
+- Financial ledgers
+- Transaction logs
+- Any system requiring zero data loss
+- Regulatory compliance
+
+**Performance Impact:**
+```rust
+// Benchmark comparison (single-threaded writes)
+FsyncSchedule::NoFsync         // ~1.2M writes/s (no durability)
+FsyncSchedule::Milliseconds(200) // ~1.2M writes/s (batch fsync)
+FsyncSchedule::SyncEach        // ~5K writes/s (sync every write)
+```
+
+<Warning>
+`SyncEach` reduces write throughput by ~99% compared to buffered writes. Only use when zero data loss is absolutely required.
+</Warning>
+
+### NoFsync
+
+Never flush data to disk explicitly (maximum throughput, no durability).
+
+```rust
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 },
+    FsyncSchedule::NoFsync
+)?;
+```
+
+**Behavior:**
+- Data is written to OS page cache
+- Relies on OS for eventual disk flushes
+- Maximum write throughput
+- No durability guarantees
+
+**Data Loss Window:**
+- Crash: May lose all unacknowledged writes
+- OS decides when to flush (typically 5-30s)
+
+**Use Cases:**
+- Development/testing
+- Temporary caching
+- Non-critical event logs
+- Metrics buffering
+
+<Warning>
+**Not recommended for production data!** Use only when data loss is acceptable or data is replicated elsewhere.
+</Warning>
+
+## Fsync Implementation Details
+
+### On Linux (FD Backend with io_uring)
+
+When using the FD backend on Linux, fsync operations leverage io_uring for batching:
+
+```rust
+// Background fsync pipeline
+loop {
+    // Collect pending fsync requests (up to batch limit)
+    let pending_fds = fsync_rx.recv_timeout(interval)?;
+    
+    // Submit batch via io_uring
+    for fd in pending_fds {
+        submit_fsync(ring, fd);
+    }
+    
+    // Wait for completion
+    ring.submit_and_wait_all()?;
+}
+```
+
+**Benefits:**
+- Multiple file descriptors fsynced in parallel
+- Reduced syscall overhead
+- Better utilization of disk I/O
+
+### On Other Platforms (Mmap Backend)
+
+Falls back to sequential `fsync()` calls:
+
+```rust
+// Sequential fsync
+for fd in pending_fds {
+    unsafe { libc::fsync(fd); }
+}
+```
+
+## Configuration Examples
+
+### High Durability (Financial System)
+
+```rust
+use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,        // Exactly-once reads
+    FsyncSchedule::SyncEach                 // Sync every write
+)?;
+
+// Guarantees:
+// ✓ Zero read replays after crash
+// ✓ Zero write data loss after crash
+// ✗ Lower throughput (~5K writes/s)
+```
+
+### High Throughput (Event Processing)
+
+```rust
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 1000 },  // Batch cursor updates
+    FsyncSchedule::Milliseconds(500)                        // 500ms fsync
+)?;
+
+// Guarantees:
+// ✓ High throughput (~1M writes/s)
+// ✓ Acceptable durability (500ms loss window)
+// ✗ May replay up to 1000 messages after crash
+// ✗ May lose up to 500ms of writes after crash
+```
+
+### Balanced (Recommended Default)
+
+```rust
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::StrictlyAtOnce,       // Exactly-once reads
+    FsyncSchedule::Milliseconds(200)        // 200ms fsync (default)
+)?;
+
+// Guarantees:
+// ✓ Exactly-once read semantics
+// ✓ Good throughput (~1M writes/s)
+// ✓ Reasonable durability (200ms loss window)
+```
+
+### Development/Testing
+
+```rust
+let wal = Walrus::with_consistency_and_schedule(
+    ReadConsistency::AtLeastOnce { persist_every: 10000 },
+    FsyncSchedule::NoFsync
+)?;
+
+// Guarantees:
+// ✓ Maximum throughput
+// ✗ No durability (data loss likely on crash)
+// ✗ Only for testing!
+```
+
+## Read Cursor Persistence
+
+### Checkpoint Behavior
+
+The `checkpoint` parameter in read operations controls cursor advancement:
+
+```rust
+// Consume entry (advance cursor)
+let entry = wal.read_next("logs", true)?;
+
+// Peek at entry (do not advance cursor)
+let entry = wal.read_next("logs", false)?;
+```
+
+**With StrictlyAtOnce:**
+```rust
+wal.read_next("logs", true)?;   // Cursor persisted immediately
+wal.read_next("logs", true)?;   // Cursor persisted immediately
+```
+
+**With AtLeastOnce:**
+```rust
+// persist_every: 3
+wal.read_next("logs", true)?;   // In-memory cursor update
+wal.read_next("logs", true)?;   // In-memory cursor update
+wal.read_next("logs", true)?;   // Cursor persisted to disk (3rd read)
+wal.read_next("logs", true)?;   // In-memory cursor update
+```
+
+### Batch Reads
+
+Batch reads respect the same consistency model:
+
+```rust
+// AtLeastOnce with persist_every: 1000
+let max_bytes = 1024 * 1024;  // 1MB
+let entries = wal.batch_read_for_topic("logs", max_bytes, true)?;
+// Returns up to 2000 entries or 1MB (whichever comes first)
+// Cursor persisted if total reads cross persist_every threshold
+```
+
+## Distributed Consistency
+
+In the distributed system, consistency also involves:
+
+### Write Leases
+
+Only the designated leader can write to each segment:
+
+```rust
+// Node 2 owns "logs:1"
+node2.append("logs:1", data)  // ✓ Accepted (has lease)
+
+// Node 3 does not own "logs:1"
+node3.append("logs:1", data)  // ✗ NotLeaderError (no lease)
+```
+
+Leases are synchronized every 100ms from Raft metadata, ensuring consistent write ownership.
+
+### Metadata Replication
+
+All topology changes (topics, segments, leaders) are replicated via Raft:
+
+```rust
+// Raft ensures all nodes have consistent view:
+node1.metadata.topics["logs"]  // current_segment: 2, leader: 3
+node2.metadata.topics["logs"]  // current_segment: 2, leader: 3
+node3.metadata.topics["logs"]  // current_segment: 2, leader: 3
+```
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Start Conservative" icon="shield-check">
+    Begin with `StrictlyAtOnce` and `Milliseconds(200)`:
+    - Ensures data safety
+    - Profile to identify bottlenecks
+    - Relax constraints if needed
+  </Card>
+  
+  <Card title="Match Your Workload" icon="chart-line">
+    Choose based on requirements:
+    - **Exactly-once needed?** → `StrictlyAtOnce`
+    - **Idempotent handlers?** → `AtLeastOnce`
+    - **Zero data loss?** → `SyncEach`
+    - **Testing only?** → `NoFsync`
+  </Card>
+  
+  <Card title="Tune for Throughput" icon="gauge-high">
+    If performance is critical:
+    - Use `AtLeastOnce` with higher `persist_every`
+    - Increase fsync interval (500ms-1s)
+    - Ensure idempotent processing
+  </Card>
+  
+  <Card title="Monitor Loss Window" icon="clock">
+    Track fsync interval + buffer depth:
+    - 200ms fsync + 1s buffer = 1.2s loss window
+    - Acceptable for most applications
+    - Adjust based on RPO requirements
+  </Card>
+</CardGroup>
+
+## Environment Variables
+
+```bash
+# Storage location (affects index files)
+export WALRUS_DATA_DIR=/var/lib/walrus
+
+# Suppress debug output
+export WALRUS_QUIET=1
+
+# Disable io_uring (use mmap instead)
+export WALRUS_DISABLE_IO_URING=1
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Architecture Overview" icon="sitemap" href="/concepts/architecture">
+    Learn about the overall system design and storage engine
+  </Card>
+  <Card title="Topics and Segments" icon="folder-tree" href="/concepts/topics-and-segments">
+    Understand how data is organized in topics and segments
+  </Card>
+</CardGroup>

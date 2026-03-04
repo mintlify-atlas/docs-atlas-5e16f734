@@ -1,0 +1,362 @@
+---
+title: METRICS Command
+description: Get Raft consensus metrics and cluster health information
+---
+
+The `METRICS` command returns Raft consensus metrics for the node handling the request. Use this to monitor cluster health, leader election, and replication status.
+
+## Syntax
+
+```
+METRICS
+```
+
+No parameters required.
+
+## Wire Format
+
+**Request:**
+```
+[4 bytes: 7] METRICS
+```
+
+**Success Response:**
+```
+[4 bytes: length] OK <json_payload>
+```
+
+Note: The response is `OK` followed by a space and the JSON payload (not just the JSON).
+
+**Error Response:**
+```
+[4 bytes: length] ERR <error message>
+```
+
+## Response Format
+
+The JSON response contains Raft metrics from the Octopii consensus engine:
+
+```json
+{
+  "node_id": 1,
+  "state": "Leader",
+  "current_term": 5,
+  "commit_index": 142,
+  "last_applied": 142,
+  "leader_id": 1,
+  "voted_for": null,
+  "log_length": 143,
+  "cluster_size": 3,
+  "peers": [
+    {
+      "node_id": 2,
+      "match_index": 142,
+      "next_index": 143
+    },
+    {
+      "node_id": 3,
+      "match_index": 142,
+      "next_index": 143
+    }
+  ]
+}
+```
+
+### Response Fields
+
+<ParamField path="node_id" type="integer">
+  The ID of the node that generated these metrics
+</ParamField>
+
+<ParamField path="state" type="string">
+  Current Raft state: `Leader`, `Follower`, or `Candidate`
+</ParamField>
+
+<ParamField path="current_term" type="integer">
+  Current election term number (increases with each leader election)
+</ParamField>
+
+<ParamField path="commit_index" type="integer">
+  Index of the highest log entry known to be committed (replicated to quorum)
+</ParamField>
+
+<ParamField path="last_applied" type="integer">
+  Index of the highest log entry applied to the metadata state machine
+</ParamField>
+
+<ParamField path="leader_id" type="integer" nullable>
+  Node ID of the current Raft leader, or `null` if unknown
+</ParamField>
+
+<ParamField path="voted_for" type="integer" nullable>
+  Node ID this node voted for in the current term, or `null` if no vote cast
+</ParamField>
+
+<ParamField path="log_length" type="integer">
+  Total number of entries in the Raft log
+</ParamField>
+
+<ParamField path="cluster_size" type="integer">
+  Number of nodes in the Raft cluster
+</ParamField>
+
+<ParamField path="peers" type="array">
+  Replication status for peer nodes (only present on leader)
+  
+  <ParamField path="node_id" type="integer">
+    Peer node ID
+  </ParamField>
+  
+  <ParamField path="match_index" type="integer">
+    Highest log entry known to be replicated on this peer
+  </ParamField>
+  
+  <ParamField path="next_index" type="integer">
+    Index of the next log entry to send to this peer
+  </ParamField>
+</ParamField>
+
+## Examples
+
+### Interactive Shell
+
+```bash
+🦭 > METRICS
+{
+  "node_id": 1,
+  "state": "Leader",
+  "current_term": 5,
+  "commit_index": 142,
+  "last_applied": 142,
+  "leader_id": 1,
+  "voted_for": null,
+  "log_length": 143,
+  "cluster_size": 3,
+  "peers": [
+    {"node_id": 2, "match_index": 142, "next_index": 143},
+    {"node_id": 3, "match_index": 142, "next_index": 143}
+  ]
+}
+```
+
+### One-off Command
+
+```bash
+# Get metrics
+cargo run --bin walrus-cli -- metrics
+
+# Pretty-print with jq
+cargo run --bin walrus-cli -- metrics | jq .
+
+# Extract specific fields
+cargo run --bin walrus-cli -- metrics | jq '.state'
+cargo run --bin walrus-cli -- metrics | jq '.leader_id'
+```
+
+### Programmatic Usage (Rust)
+
+```rust
+use distributed_walrus::cli_client::CliClient;
+use serde_json::Value;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let client = CliClient::new("127.0.0.1:9091");
+    
+    // Get metrics as JSON string
+    let metrics_json = client.metrics().await?;
+    
+    // Parse JSON
+    let metrics: Value = serde_json::from_str(&metrics_json)?;
+    println!("Node state: {}", metrics["state"]);
+    println!("Leader ID: {}", metrics["leader_id"]);
+    println!("Commit index: {}", metrics["commit_index"]);
+    
+    Ok(())
+}
+```
+
+## Use Cases
+
+### Check Cluster Health
+
+```bash
+# Verify all nodes see the same leader
+for port in 9091 9092 9093; do
+    echo "Node on port $port:"
+    cargo run --bin walrus-cli -- --addr 127.0.0.1:$port metrics | jq '{node_id, state, leader_id}'
+done
+```
+
+### Monitor Replication Lag
+
+```bash
+# Check if followers are caught up (match_index should equal commit_index)
+cargo run --bin walrus-cli -- metrics | jq '.peers[] | "Node \(.node_id): match=\(.match_index) next=\(.next_index)"'
+```
+
+### Detect Leader Elections
+
+```bash
+# Watch for term changes (indicates elections)
+watch -n 1 'cargo run --bin walrus-cli -- metrics | jq .current_term'
+```
+
+### Verify Quorum
+
+```bash
+# Ensure cluster size is correct (should be 3+ for fault tolerance)
+cargo run --bin walrus-cli -- metrics | jq .cluster_size
+```
+
+## Understanding Raft Metrics
+
+### Node States
+
+**Leader**
+- One leader per cluster at a time
+- Handles all metadata writes (topic creation, rollover)
+- Replicates log entries to followers
+- Has `peers` array with replication status
+
+**Follower**
+- Majority of nodes are followers
+- Replicate log entries from leader
+- Can become candidate if leader fails
+- No `peers` array in metrics
+
+**Candidate**
+- Temporary state during leader election
+- Node is requesting votes from peers
+- Quickly transitions to leader or follower
+- Rare to observe (election is fast)
+
+### Indexes Explained
+
+**commit_index**
+- Highest entry replicated to a quorum
+- Safe to apply to state machine
+- Increases as leader replicates entries
+
+**last_applied**
+- Highest entry actually applied to metadata
+- Should match or be slightly behind commit_index
+- Gap indicates apply loop is processing
+
+**match_index (per peer)**
+- What the leader knows about each follower
+- Used to determine commit_index (quorum)
+- Lag indicates slow or disconnected follower
+
+**next_index (per peer)**
+- Next entry to send to follower
+- Usually match_index + 1
+- Rolls back on AppendEntries rejection
+
+## Cluster Health Indicators
+
+### Healthy Cluster
+
+```json
+{
+  "state": "Leader",
+  "commit_index": 100,
+  "last_applied": 100,
+  "peers": [
+    {"node_id": 2, "match_index": 100, "next_index": 101},
+    {"node_id": 3, "match_index": 100, "next_index": 101}
+  ]
+}
+```
+
+- All peers caught up (match_index == commit_index)
+- last_applied == commit_index
+- Clear leader elected
+
+### Replication Lag
+
+```json
+{
+  "state": "Leader",
+  "commit_index": 100,
+  "peers": [
+    {"node_id": 2, "match_index": 100, "next_index": 101},
+    {"node_id": 3, "match_index": 85, "next_index": 86}
+  ]
+}
+```
+
+- Node 3 is lagging (match_index 85 vs commit_index 100)
+- May indicate network issues or slow node
+- Leader will keep retrying replication
+
+### No Leader
+
+```json
+{
+  "state": "Follower",
+  "leader_id": null,
+  "current_term": 5
+}
+```
+
+- Cluster is in election
+- No writes possible until leader elected
+- Check for network partitions
+
+### Split Brain (Should Not Happen)
+
+```bash
+# Node 1 thinks it's leader
+{"state": "Leader", "leader_id": 1}
+
+# Node 2 also thinks it's leader (term should prevent this)
+{"state": "Leader", "leader_id": 2}
+```
+
+- Raft prevents this with term numbers
+- If observed, indicates a serious bug
+
+## Monitoring and Alerting
+
+### Critical Alerts
+
+- No leader for > 30 seconds
+- Cluster size mismatch across nodes
+- Replication lag > 1000 entries
+- Frequent term changes (election storm)
+
+### Warning Alerts
+
+- last_applied behind commit_index by > 100
+- Peer match_index lagging by > 500 entries
+- State is Candidate for > 5 seconds
+
+### Dashboards
+
+Key metrics to graph:
+- current_term (leader elections)
+- commit_index (write throughput)
+- match_index per peer (replication health)
+- State transitions (Leader/Follower/Candidate)
+
+## Metadata vs. Data
+
+Important: METRICS shows **metadata consensus only**:
+- Topic registrations
+- Segment rollovers
+- Leader assignments
+- Node membership
+
+It does **not** show:
+- Data write throughput
+- Entry counts per topic (use STATE)
+- Storage usage
+- Client connection counts
+
+Raft is only used for metadata coordination, not data replication.
+
+## Related Commands
+
+- [STATE](/api/state) - View topic-specific metadata and entry counts
+- [REGISTER](/api/register) - Operations that go through Raft consensus

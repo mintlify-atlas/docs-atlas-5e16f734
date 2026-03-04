@@ -1,0 +1,434 @@
+---
+title: Topics and Segments
+description: How topics are partitioned into segments, rollover mechanics, and load distribution in Walrus
+---
+
+Topics in Walrus are logical streams that are automatically partitioned into **segments** for load distribution across the cluster. This segment-based architecture enables automatic load balancing and fault tolerance.
+
+## Topic Organization
+
+### What is a Topic?
+
+A topic is a named stream of messages (similar to Kafka topics or Kinesis streams). Clients append entries to topics and read them back in order.
+
+```rust
+// Creating a topic (implicit on first write)
+> REGISTER logs
+
+// Writing to a topic
+> PUT logs "application started"
+> PUT logs "request processed"
+
+// Reading from a topic
+> GET logs
+OK application started
+
+> GET logs
+OK request processed
+```
+
+### Topic State
+
+Each topic maintains metadata that is replicated across all nodes via Raft:
+
+```rust
+TopicState {
+  current_segment: u64,              // Active segment for new writes
+  leader_node: NodeId,               // Node handling writes to current segment
+  sealed_segments: HashMap<SegmentId, EntryCount>,  // Immutable historical segments
+  segment_leaders: HashMap<SegmentId, NodeId>       // Which node owns each segment
+}
+```
+
+**Example:**
+```json
+{
+  "current_segment": 3,
+  "leader_node": 2,
+  "sealed_segments": {
+    "1": 1000000,
+    "2": 950000
+  },
+  "segment_leaders": {
+    "1": 3,
+    "2": 1,
+    "3": 2
+  }
+}
+```
+
+This shows topic "logs" with:
+- Segment 1: sealed with 1,000,000 entries, originally led by node 3
+- Segment 2: sealed with 950,000 entries, originally led by node 1
+- Segment 3: currently active, led by node 2
+
+## Segments
+
+### What is a Segment?
+
+A segment is a contiguous sequence of entries within a topic. Each segment:
+- Has a unique ID (1, 2, 3, ...)
+- Is owned by a single leader node that handles writes
+- Contains up to `WALRUS_MAX_SEGMENT_ENTRIES` entries (default: 1,000,000)
+- Becomes **sealed** when full, with leadership rotating to the next node
+
+### Segment Lifecycle
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Segment 1 Lifecycle (topic: "logs")                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  [1] CREATED                                                │
+│      └─► Topic "logs" created via Raft                     │
+│          leader_node: 1                                     │
+│          current_segment: 1                                 │
+│          segment_leaders: {1 → 1}                           │
+│                                                             │
+│  [2] ACTIVE (receiving writes)                              │
+│      └─► Node 1 holds lease for "logs:1"                   │
+│          Entries appended: 0 → 500,000 → 1,000,000         │
+│          Clients write to node 1                            │
+│          Reads can be served from node 1                    │
+│                                                             │
+│  [3] ROLLOVER TRIGGERED                                     │
+│      └─► Monitor detects: 1,000,000 >= threshold           │
+│          Propose RolloverTopic via Raft                     │
+│          Select next leader: node 2 (round-robin)           │
+│                                                             │
+│  [4] SEALED (immutable)                                     │
+│      └─► Metadata updated:                                 │
+│          sealed_segments: {1 → 1,000,000}                   │
+│          current_segment: 2 (new active segment)            │
+│          leader_node: 2 (for new writes)                    │
+│          segment_leaders: {1 → 1, 2 → 2}                    │
+│                                                             │
+│          Node 1: Loses write lease for "logs:1"             │
+│                  But retains read access!                   │
+│          Node 2: Gains write lease for "logs:2"             │
+│                                                             │
+│  [5] HISTORICAL READS                                       │
+│      └─► Sealed segment data remains on node 1             │
+│          Readers with cursor in segment 1 → routed to node 1│
+│          No data migration needed                           │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Segment Naming (WAL Keys)
+
+Internally, segments are identified by WAL keys in the format `<topic>:<segment_id>`:
+
+```rust
+// Topic "logs", segment 1
+wal_key = "logs:1"
+
+// Topic "metrics", segment 5
+wal_key = "metrics:5"
+```
+
+These keys are used for:
+- **Lease management**: `leases.contains("logs:1")`
+- **Storage operations**: `walrus.batch_append_for_topic("logs:1", data)`
+- **Offset tracking**: `offsets["logs:1"] = 1_000_050`
+
+## Rollover Mechanics
+
+### Triggering Rollover
+
+The monitor loop on each node checks its owned segments every 10 seconds:
+
+```rust
+// Pseudocode from monitor.rs
+fn check_rollovers() {
+    for (topic, segment_id) in metadata.owned_topics(self.node_id) {
+        let wal_key = format!("{}:{}", topic, segment_id);
+        let entry_count = controller.tracked_entry_count(&wal_key);
+        
+        if entry_count >= MAX_SEGMENT_ENTRIES {
+            // Select next leader (round-robin)
+            let voters = raft.voters();
+            let my_index = voters.iter().position(|&n| n == self.node_id);
+            let next_index = (my_index + 1) % voters.len();
+            let next_leader = voters[next_index];
+            
+            // Propose rollover via Raft
+            propose_metadata(RolloverTopic {
+                name: topic,
+                new_leader: next_leader,
+                sealed_segment_entry_count: entry_count
+            });
+        }
+    }
+}
+```
+
+### Rollover Process
+
+**Step 1: Monitor Detection**
+```
+Node 2 monitors "logs:1"
+Entry count: 1,000,050 >= 1,000,000
+→ TRIGGER ROLLOVER
+```
+
+**Step 2: Select Next Leader**
+```
+Raft voters: [1, 2, 3]
+Current leader: node 2 (index 1)
+Next leader: (1 + 1) % 3 = 2 → voters[2] = node 3
+```
+
+**Step 3: Raft Proposal**
+```
+propose_metadata(RolloverTopic {
+    name: "logs",
+    new_leader: 3,
+    sealed_segment_entry_count: 1_000_050
+})
+```
+
+**Step 4: Metadata Update (applied to all nodes)**
+```rust
+// Before rollover
+{
+  current_segment: 1,
+  leader_node: 2,
+  sealed_segments: {},
+  segment_leaders: {1 → 2}
+}
+
+// After rollover
+{
+  current_segment: 2,        // New active segment
+  leader_node: 3,            // New leader for writes
+  sealed_segments: {
+    1 → 1_000_050           // Sealed with final count
+  },
+  segment_leaders: {
+    1 → 2,                  // Original leader preserved for reads
+    2 → 3                   // New segment leader
+  }
+}
+```
+
+**Step 5: Lease Transfer (within 100ms)**
+```
+Node 2 (old leader):
+  └─► update_leases() removes "logs:1" from lease set
+      Writes to "logs:1" → NotLeaderError
+      Reads from "logs:1" → Still allowed (sealed data)
+
+Node 3 (new leader):
+  └─► update_leases() grants "logs:2" lease
+      Writes to "logs:2" → Accepted
+      Starts accepting new entries
+```
+
+### Rollover Timing
+
+<Accordion title="Why round-robin leadership?">
+Round-robin selection ensures even load distribution across the cluster. Each node takes turns leading segments, preventing any single node from becoming a bottleneck.
+
+**Example with 3 nodes:**
+- Segment 1: Node 1
+- Segment 2: Node 2  
+- Segment 3: Node 3
+- Segment 4: Node 1 (cycle repeats)
+</Accordion>
+
+<Accordion title="What happens to in-flight writes during rollover?">
+Writes that arrive during the 100ms lease sync window:
+- **To old segment**: Rejected with NotLeaderError after lease removed
+- **To new segment**: Accepted once new leader gains lease
+- Clients should retry on NotLeaderError (automatic in most clients)
+</Accordion>
+
+## Load Distribution
+
+### Automatic Balancing
+
+Segment-based leadership rotation provides automatic load balancing:
+
+```
+Timeline: Topic "logs" with 3 nodes
+
+T0: Create topic
+    └─► Segment 1 → Node 1 (initial leader via hash)
+
+T1: Segment 1 fills (1M entries)
+    └─► Rollover: Segment 2 → Node 2
+
+T2: Segment 2 fills (1M entries)
+    └─► Rollover: Segment 3 → Node 3
+
+T3: Segment 3 fills (1M entries)
+    └─► Rollover: Segment 4 → Node 1 (cycle repeats)
+
+Write Load Distribution:
+  Node 1: Segments 1, 4, 7, 10, ... (~33%)
+  Node 2: Segments 2, 5, 8, 11, ... (~33%)
+  Node 3: Segments 3, 6, 9, 12, ... (~33%)
+```
+
+### Read Distribution
+
+Reads are distributed based on cursor position:
+
+```
+Topic "logs" with 3 segments:
+  Segment 1: 1,000,000 entries (sealed, node 1)
+  Segment 2: 950,000 entries (sealed, node 2)
+  Segment 3: 500,000 entries (active, node 3)
+
+Reader with cursor at segment 1, offset 5000:
+  └─► Routes to node 1 (original leader of segment 1)
+
+Reader with cursor at segment 2, offset 100:
+  └─► Routes to node 2 (original leader of segment 2)
+
+Reader with cursor at segment 3, offset 0:
+  └─► Routes to node 3 (current leader)
+```
+
+<Info>
+Sealed segments remain on their original leader node for reads. This eliminates the need for data migration during rollover, improving performance and simplifying the architecture.
+</Info>
+
+## Read Cursors and Segment Advancement
+
+### Cursor Structure
+
+```rust
+ReadCursor {
+  segment: u64,              // Current segment being read
+  delivered_in_segment: u64  // Entries consumed in this segment
+}
+```
+
+### Cursor Advancement
+
+When a reader consumes all entries in a sealed segment, the cursor automatically advances:
+
+```rust
+// Initial cursor
+cursor = {segment: 1, delivered: 0}
+
+// After reading 1,000,000 entries from segment 1
+cursor = {segment: 1, delivered: 1_000_000}
+
+// Next read() call:
+if cursor.delivered >= sealed_segments[1] {
+    // Segment 1 exhausted, advance to segment 2
+    cursor.segment = 2;
+    cursor.delivered = 0;
+}
+
+// Now reading from segment 2
+cursor = {segment: 2, delivered: 0}
+```
+
+### Read Flow Across Segments
+
+```
+┌────────────────────────────────────────────────────────┐
+│ Reader consuming topic "logs"                          │
+├────────────────────────────────────────────────────────┤
+│                                                        │
+│  Cursor: {segment: 1, delivered: 999_995}              │
+│    │                                                   │
+│    ├─► read() → Entry 999,995 (from node 1)           │
+│    ├─► read() → Entry 999,996 (from node 1)           │
+│    ├─► read() → Entry 999,997 (from node 1)           │
+│    ├─► read() → Entry 999,998 (from node 1)           │
+│    ├─► read() → Entry 999,999 (from node 1)           │
+│    ├─► read() → Entry 1,000,000 (from node 1)         │
+│    │                                                   │
+│    ├─► Check: 1,000,000 >= sealed_count(1)?           │
+│    │   YES → Segment 1 exhausted                      │
+│    │                                                   │
+│    ├─► Advance cursor:                                │
+│    │   segment = 2                                     │
+│    │   delivered = 0                                   │
+│    │                                                   │
+│    ├─► read() → Entry 1 (from node 2, segment 2)      │
+│    ├─► read() → Entry 2 (from node 2, segment 2)      │
+│    └─► ...                                             │
+│                                                        │
+└────────────────────────────────────────────────────────┘
+```
+
+## Configuration
+
+### Segment Size
+
+Control when segments roll over:
+
+```bash
+# Default: 1,000,000 entries per segment
+export WALRUS_MAX_SEGMENT_ENTRIES=1000000
+
+# Smaller segments (more frequent rollovers)
+export WALRUS_MAX_SEGMENT_ENTRIES=500000
+
+# Larger segments (less frequent rollovers)
+export WALRUS_MAX_SEGMENT_ENTRIES=5000000
+```
+
+### Monitor Interval
+
+Control how often rollovers are checked:
+
+```bash
+# Default: 10 seconds
+export WALRUS_MONITOR_CHECK_MS=10000
+
+# More frequent checks (faster rollover response)
+export WALRUS_MONITOR_CHECK_MS=5000
+
+# Less frequent checks (lower CPU overhead)
+export WALRUS_MONITOR_CHECK_MS=30000
+```
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Segment Sizing" icon="ruler">
+    Choose segment size based on your workload:
+    - **High throughput**: Larger segments (reduce rollover overhead)
+    - **Even load distribution**: Smaller segments (more frequent rotation)
+    - **Default 1M entries** ≈ 100MB (depending on payload size)
+  </Card>
+  
+  <Card title="Monitor Interval" icon="clock">
+    Balance responsiveness vs overhead:
+    - **10s default**: Good balance for most workloads
+    - **5s**: Faster rollover (slightly higher CPU)
+    - **30s**: Lower overhead (acceptable for large segments)
+  </Card>
+  
+  <Card title="Topic Creation" icon="plus">
+    Topics are created automatically on first write:
+    - Initial leader selected via consistent hash
+    - Explicit creation: `REGISTER <topic>`
+    - All nodes can create topics (routed via Raft)
+  </Card>
+  
+  <Card title="Read Patterns" icon="book-open">
+    Optimize for your read patterns:
+    - **Sequential reads**: Cursors automatically advance across segments
+    - **Historical reads**: Access sealed segments from original leader
+    - **No replication**: Sealed data stays on original node
+  </Card>
+</CardGroup>
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Architecture Overview" icon="sitemap" href="/concepts/architecture">
+    Understand the overall system architecture and components
+  </Card>
+  <Card title="Raft Consensus" icon="network-wired" href="/concepts/raft-consensus">
+    Learn how Raft coordinates segment metadata
+  </Card>
+</CardGroup>
