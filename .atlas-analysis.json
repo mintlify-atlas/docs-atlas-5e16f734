@@ -1,0 +1,127 @@
+{
+  "projectType": "data-platform",
+  "projectName": "Walrus",
+  "projectDescription": "Distributed log streaming engine built from first principles with Raft consensus and segment-based partitioning",
+  "theme": "aspen",
+  "primaryColor": "#040404",
+  "lightColor": "#6c6c6c",
+  "darkColor": "#434343",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/topics-and-segments",
+              "concepts/consistency-models",
+              "concepts/raft-consensus"
+            ]
+          },
+          {
+            "group": "Standalone Library",
+            "pages": [
+              "library/overview",
+              "library/basic-operations",
+              "library/batch-operations",
+              "library/configuration",
+              "library/storage-backends"
+            ]
+          },
+          {
+            "group": "Distributed Cluster",
+            "pages": [
+              "cluster/overview",
+              "cluster/deployment",
+              "cluster/client-protocol",
+              "cluster/segment-management",
+              "cluster/failure-recovery"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/configuration",
+              "operations/monitoring",
+              "operations/performance-tuning",
+              "operations/troubleshooting"
+            ]
+          },
+          {
+            "group": "Resources",
+            "pages": [
+              "resources/benchmarks",
+              "resources/correctness",
+              "resources/contributing",
+              "resources/changelog"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Library API",
+            "pages": [
+              "api/walrus",
+              "api/read-consistency",
+              "api/fsync-schedule",
+              "api/wal-entry"
+            ]
+          },
+          {
+            "group": "CLI Commands",
+            "pages": [
+              "api/cli-overview",
+              "api/register",
+              "api/put",
+              "api/get",
+              "api/state",
+              "api/metrics"
+            ]
+          },
+          {
+            "group": "Cluster API",
+            "pages": [
+              "api/node-controller",
+              "api/metadata",
+              "api/bucket-storage"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Segment-based leadership rotation for automatic load balancing",
+    "Raft consensus for fault-tolerant metadata coordination",
+    "Lease-based write fencing to prevent split-brain",
+    "High-performance storage with io_uring on Linux",
+    "Batch operations with atomic guarantees",
+    "Configurable consistency models (strict and relaxed)",
+    "TCP client protocol with auto-forwarding"
+  ],
+  "publicApiSurface": [
+    "Walrus::new() - Create WAL instance",
+    "Walrus::append_for_topic() - Write to topic",
+    "Walrus::read_next() - Read from topic",
+    "Walrus::batch_append_for_topic() - Atomic batch writes",
+    "Walrus::batch_read_for_topic() - Batch reads",
+    "REGISTER <topic> - Create topic",
+    "PUT <topic> <payload> - Append message",
+    "GET <topic> - Read message",
+    "STATE <topic> - Get topic metadata",
+    "METRICS - Get cluster metrics"
+  ]
+}
